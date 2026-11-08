@@ -1,0 +1,48 @@
+==========================================
+ Hotel Pricing Assistant
+ User Guide
+==========================================
+
+DAILY WORKFLOW
+--------------
+1. Double-click "Start_Pricing_UI.bat" to open the app window.
+2. Click the big button "? Run Pricing Now" (top-left).
+3. Wait for the dark log box at the bottom to say "Pricing finished".
+   The table refreshes automatically with recommended rates for the
+   next 90 days, per room type.
+4. Click ANY row in the table to see WHY that price was set:
+   - One-line summary (recommended rate and how much it moved)
+   - A bar chart comparing base rate vs recommended rate
+   - 5 factor cards: Special Event / Supply & Demand / Booking Pace /
+     Competitor / Forecast RevPAR
+   - Confidence score (below 70 means use your own judgement too)
+5. Use the dropdowns above the table to filter by date range or room type.
+
+TABLE ROW COLORS
+----------------
+Red    = Peak Demand
+Orange = High Demand
+Green  = Low Demand
+
+PREFER NOT TO USE THE WINDOW?
+-----------------------------
+Double-click "Run_Pricing_Now.bat" to run one pricing cycle directly.
+The daily 6:00 AM run still happens automatically via scheduler.py.
+
+IMPORTANT NOTE
+--------------
+The API_KEY and BASE_URL in "hotel rms.py" are placeholders, so the system
+automatically falls back to built-in demo data. Once your own endpoint and
+key are filled in, no UI changes are needed - just click "Run Pricing Now".
+
+PUBLIC HOLIDAYS / SPECIAL DATES
+------------------------------
+See README.md for the public_holidays.csv column format
+(Date, Event_Name, Holiday_Factor) and examples.
+
+TROUBLESHOOTING
+---------------
+Q: Nothing happens / error in the log?
+   Screenshot the dark log box and send it to your system administrator.
+Q: A result file is open in Excel - will it fail?
+   No. The engine automatically saves to an alternative filename.
