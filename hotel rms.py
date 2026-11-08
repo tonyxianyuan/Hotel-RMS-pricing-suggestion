@@ -42,6 +42,12 @@ if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
 from event_calendar import CalendarError, load_event_calendar  # noqa: E402
+from timezone_config import (  # noqa: E402
+    format_utc_offset,
+    load_timezone,
+    parse_property_now,
+    resolve_now,
+)
 
 # Keep console output readable on Windows terminals with a legacy code page.
 for _stream in (sys.stdout, sys.stderr):
@@ -87,10 +93,21 @@ MIN_RATE_MULTIPLIER = 0.70
 MAX_RATE_MULTIPLIER = 2.00
 EVENT_CAP_HEADROOM = 1.60
 
+# Every "today / now" value in this run comes from one aware timestamp in the
+# selected property timezone. The staff UI writes the choice; this process
+# only reads it. With no setting, the machine's local time is used.
+TZ_NAME = load_timezone()
+AS_OF_DATETIME_OVERRIDE = os.environ.get("RMS_AS_OF_DATETIME", "").strip()
+try:
+    NOW = resolve_now(TZ_NAME, AS_OF_DATETIME_OVERRIDE or None)
+except ValueError as exc:
+    raise SystemExit("[ERROR] {}".format(exc)) from exc
+
 # Optional reproducibility anchor. Set RMS_AS_OF_DATE=YYYY-MM-DD to replay a
 # past pricing window for back-testing and year-over-year comparison; the whole
-# run, including the synthetic demo feed, then becomes reproducible. With the
-# variable unset, each daily run uses the real system date.
+# run, including the synthetic demo feed, then becomes reproducible. With both
+# variables unset, each daily run uses the current date in the selected
+# timezone.
 AS_OF_OVERRIDE = os.environ.get("RMS_AS_OF_DATE", "").strip()
 if AS_OF_OVERRIDE:
     try:
@@ -102,7 +119,7 @@ if AS_OF_OVERRIDE:
             )
         ) from exc
 else:
-    AS_OF_DATE = datetime.today().date()
+    AS_OF_DATE = NOW.date()
 
 TODAY = pd.Timestamp(AS_OF_DATE)
 WINDOW_START = TODAY
@@ -144,7 +161,7 @@ def fetch_dashboard_data():
     except Exception as exc:
         log_warn("Dashboard unavailable ({}). Using synthetic demo metrics.".format(exc))
         data = {
-            "property_now": "{} 21:00:00".format(AS_OF_DATE.isoformat()),
+            "property_now": NOW.strftime("%Y-%m-%d %H:%M:%S"),
             "roomsOccupied": 4,
             "percentageOccupied": 80,
             "inHouse": 3,
@@ -160,7 +177,7 @@ def fetch_dashboard_data():
         "in_house_guests": data.get("guestsInHouse", 0),
         "live_today_occ": data.get("percentageOccupied", 0),
         "property_now_str": data.get(
-            "property_now", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "property_now", NOW.strftime("%Y-%m-%d %H:%M:%S")
         ),
     }
 
@@ -171,7 +188,12 @@ ROOMS_BLOCKED = DASH_METRICS["rooms_blocked"]
 IN_HOUSE_ROOMS = DASH_METRICS["in_house_rooms"]
 IN_HOUSE_GUESTS = DASH_METRICS["in_house_guests"]
 LIVE_TODAY_OCC = DASH_METRICS["live_today_occ"]
-PROPERTY_NOW_STR = DASH_METRICS["property_now_str"]
+PROPERTY_NOW, PROPERTY_NOW_WARNING = parse_property_now(
+    DASH_METRICS["property_now_str"], TZ_NAME, NOW
+)
+if PROPERTY_NOW_WARNING:
+    log_warn(PROPERTY_NOW_WARNING)
+PROPERTY_NOW_STR = PROPERTY_NOW.strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ==========================================
@@ -305,9 +327,12 @@ def deterministic_competitor_adr(stay_date):
 # ==========================================
 # 3. LOAD EXTERNAL INPUTS
 # ==========================================
+log_info("Property timezone: {} ({})".format(
+    TZ_NAME or "local system time", format_utc_offset(TZ_NAME)))
+log_info("Property time: {}".format(NOW.strftime("%Y-%m-%d %H:%M:%S")))
 log_info("Run date: {} ({})".format(
     AS_OF_DATE.isoformat(),
-    "RMS_AS_OF_DATE override" if AS_OF_OVERRIDE else "system date"))
+    "RMS_AS_OF_DATE override" if AS_OF_OVERRIDE else "property date"))
 log_info("Pricing window: {} .. {} ({} days)".format(
     WINDOW_START.date(), WINDOW_END.date(), PRICING_WINDOW_DAYS))
 log_info("Data mode: {} ({})".format(DATA_MODE, DATA_MODE_LABEL))
@@ -488,7 +513,7 @@ df_model["Recommended_ADR"] = (
 )
 
 # Same-day time decay and guest density surcharge.
-prop_hour = pd.to_datetime(PROPERTY_NOW_STR).hour
+prop_hour = PROPERTY_NOW.hour
 guest_density = (IN_HOUSE_GUESTS / IN_HOUSE_ROOMS) if IN_HOUSE_ROOMS > 0 else 0
 
 
@@ -587,7 +612,7 @@ try:
     log_ok("Technical view written: {}".format(tech_filename))
 except PermissionError:
     alternative_name = "hotel_name_Live_Dashboard_{}_{}.csv".format(
-        date_suffix, datetime.today().strftime("%H%M%S")
+        date_suffix, NOW.strftime("%H%M%S")
     )
     df_dashboard.to_csv(alternative_name, index=False)
     log_warn("Technical view file was open in Excel; saved as {}".format(alternative_name))
@@ -711,7 +736,7 @@ try:
     log_ok("Manager view written: {}".format(manager_filename))
 except PermissionError:
     alternative_mgr_name = "hotel_name_RMS_Manager_View_{}_{}.csv".format(
-        date_suffix, datetime.today().strftime("%H%M%S")
+        date_suffix, NOW.strftime("%H%M%S")
     )
     df_manager_view.to_csv(alternative_mgr_name, index=False)
     log_warn("Manager view file was open in Excel; saved as {}".format(alternative_mgr_name))

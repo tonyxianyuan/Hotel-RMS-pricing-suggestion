@@ -24,6 +24,17 @@ import webbrowser
 from datetime import datetime
 from tkinter import ttk, messagebox
 
+from timezone_config import (
+    choice_labels,
+    choice_values,
+    format_clock,
+    format_utc_offset,
+    load_timezone,
+    resolve_now,
+    save_timezone,
+    tz_available,
+)
+
 # ==========================================
 # Path setup (works no matter where the app is launched from)
 # ==========================================
@@ -129,6 +140,7 @@ class RMSApp:
         self.root = root
         self.records = []
         self.running = False
+        self._tz_dirty = False
 
         root.title("Hotel Pricing Assistant")
         root.geometry("1180x760")
@@ -146,6 +158,7 @@ class RMSApp:
         style.configure("Big.TLabel", font=("Segoe UI", 11, "bold"))
 
         self.build_top_bar()
+        self.build_context_bar()
         self.build_table()
         self.build_detail_panel()
         self.build_status_bar()
@@ -201,6 +214,87 @@ class RMSApp:
             foreground="#666666",
         )
         self.last_run_lbl.pack(side="right", padx=(0, 12))
+
+    # ---------- Context bar: property timezone ----------
+    def build_context_bar(self):
+        """A second, independent row so the crowded top bar stays untouched."""
+        bar = ttk.Frame(self.root, padding=(12, 2, 12, 4))
+        bar.pack(fill="x")
+
+        ttk.Label(bar, text="Timezone:").pack(side="left")
+        self.tz_values = choice_values()
+        self.tz_labels = choice_labels()
+        self.tz_var = tk.StringVar()
+        self.tz_cb = ttk.Combobox(
+            bar,
+            textvariable=self.tz_var,
+            state="readonly",
+            width=34,
+            values=self.tz_labels,
+        )
+        self.tz_cb.pack(side="left", padx=(6, 0))
+        self.tz_cb.bind("<<ComboboxSelected>>", self.on_timezone_changed)
+
+        self.tz_hint_lbl = ttk.Label(bar, text="", foreground="#666666")
+        self.tz_hint_lbl.pack(side="right")
+
+        current = load_timezone()
+        try:
+            index = self.tz_values.index(current)
+        except ValueError:
+            index = 0
+        self.tz_cb.current(index)
+        self.refresh_tz_hint(current)
+
+    def refresh_tz_hint(self, name):
+        """Keep the current timezone and its consequences visible at all times."""
+        offset = format_utc_offset(name)
+        if name is None:
+            hint = (
+                "Prices and the daily 06:00 run follow this computer's local "
+                "time ({}).".format(offset)
+            )
+        else:
+            hint = (
+                "Prices and the daily 06:00 run follow {} ({}). "
+                "Pricing date: {}.".format(
+                    name, offset, resolve_now(name).strftime("%Y-%m-%d")
+                )
+            )
+        self.tz_hint_lbl.configure(text=hint)
+
+    def on_timezone_changed(self, _event):
+        """One-step switch: validate, persist, refresh, then re-run pricing."""
+        index = self.tz_cb.current()
+        if index < 0:
+            return
+        name = self.tz_values[index]
+        if name is not None and not tz_available(name):
+            messagebox.showwarning(
+                "Timezone data not available",
+                "The IANA timezone database is not installed for {}.\n\n"
+                "Ask your administrator to run: pip install tzdata\n"
+                "The setting stays on 'Follow local system time', which needs "
+                "no extra package.".format(name),
+            )
+            self.tz_cb.current(0)
+            self.refresh_tz_hint(None)
+            return
+        try:
+            save_timezone(name)
+        except Exception as exc:
+            messagebox.showerror("Could not save timezone", str(exc))
+            return
+        self.refresh_tz_hint(name)
+        self.log(
+            "[INFO] Timezone set to {}. Refreshing rates...".format(
+                name or "local system time"
+            )
+        )
+        if self.running:
+            self._tz_dirty = True
+        else:
+            self.run_pricing()
 
     # ---------- Middle: results table ----------
     def build_table(self):
@@ -369,7 +463,7 @@ class RMSApp:
         self.run_btn.configure(state="disabled")
         self.log(
             "[RUN] {} Running pricing engine, please wait...".format(
-                datetime.now().strftime("%H:%M:%S")
+                resolve_now(load_timezone()).strftime("%H:%M:%S")
             )
         )
 
@@ -410,6 +504,9 @@ class RMSApp:
                 "[ERROR] Pricing engine failed. Check the log above or contact "
                 "your system administrator."
             )
+        if self._tz_dirty:
+            self._tz_dirty = False
+            self.root.after(0, self.run_pricing)
 
     # ---------- Load / display results ----------
     def load_results(self):
@@ -432,7 +529,7 @@ class RMSApp:
         self.populate_table()
         self.update_mode_banner()
         self.last_run_lbl.configure(
-            text="Data generated: {}".format(datetime.now().strftime("%Y-%m-%d %H:%M"))
+            text="Data generated: {}".format(format_clock(resolve_now(load_timezone())))
         )
         self.log(
             "[INFO] Loaded {} rate recommendations. Click any row to see why it "

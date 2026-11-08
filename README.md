@@ -21,11 +21,14 @@ small staff-facing UI.
 | `Public holidays.csv` | **Staff-maintained** holidays and special events (the only event input) |
 | `rms_gui.py` | Tkinter staff UI: run pricing, browse results, explain rates, open the calendar |
 | `scheduler.py` | Unattended daily 06:00 run (`--run-now` for an immediate cycle) |
+| `timezone_config.py` | Shared timezone settings and IANA availability checks |
 | `Run_Pricing_Now.bat` | Windows: run one pricing cycle |
 | `Start_Pricing_UI.bat` | Windows: open the staff UI |
 | `User_Guide.txt` | Short operator guide |
 
-Generated reports, runtime logs, `__pycache__` and local credentials are
+`timezone_settings.json` is created locally by the staff UI when a timezone
+is chosen; it is git-ignored, so a fresh clone starts on local system time.
+Generated reports, runtime logs, `__pycache__` and local credentials are also
 git-ignored (see `.gitignore`).
 
 ## Requirements
@@ -38,6 +41,11 @@ pip install pandas numpy requests schedule
 
 `tkinter` ships with standard CPython. The two `.bat` files expect Python on
 `PATH`; on other platforms run the scripts directly.
+
+Named IANA timezones additionally need the system IANA database; on Windows
+install the optional `tzdata` package (`pip install tzdata`). The default
+`Follow local system time` needs nothing extra and works out of the box.
+No `pytz` dependency is required - see the scheduler note below.
 
 ## Quick start
 
@@ -81,7 +89,10 @@ file can carry its own instructions.
 - A `YYYY-MM-DD` one-off row overrides a recurring row on that same date.
   Among rows of the same kind, the last row wins. Use this to override a
   national holiday for a specific year.
-- Only dates inside the current 90-day window are priced.
+- Only dates inside the current 90-day window are priced. The window starts
+  on the current date in the selected property timezone, so switching across
+  the date line shifts it by one day and changes which calendar rows fall
+  inside it. This is expected behaviour.
 - A missing file, a missing `Date` / `Event_Factor` column, a bad date, a
   non-numeric or non-positive factor stops the run with an error and a line
   number. The engine does **not** silently fall back to demo events.
@@ -146,7 +157,15 @@ set RMS_AS_OF_DATE=2026-09-01
 python "hotel rms.py"
 ```
 
-Leave the variable unset for normal daily operation. In `DEMO` mode the
+For a repeatable *time of day* (used to check the same-day discount tiers),
+set `RMS_AS_OF_DATETIME` to a wall-clock timestamp in the selected timezone:
+
+```
+set RMS_AS_OF_DATETIME=2026-09-01 22:30:00
+python "hotel rms.py"
+```
+
+Leave both variables unset for normal daily operation. In `DEMO` mode the
 synthetic reservation feed is anchored to the run date, so OTB and pace
 figures differ between runs on *different* days; `RMS_AS_OF_DATE` removes even
 that variation. Connect a live PMS for fully reproducible operational data.
@@ -179,22 +198,61 @@ contains no real endpoint or credential.
   `dateCreated`, `status`, `startDate`, `endDate`, `balance`
   (statuses used: `confirmed`, `checked_in`, `checked_out`)
 
+`property_now` is interpreted in the selected property timezone: a value
+without a UTC offset is treated as wall-clock time in that timezone, while a
+value with an offset is converted to it. Missing or unparseable values fall
+back to the current property time with a `[WARN]` line, so a bad timestamp
+never stops a run.
+
 Set `PMS_API_KEY` and `PMS_BASE_URL` as environment variables. Never commit
 real credentials. Without them the engine short-circuits to synthetic data
 instead of waiting on a network timeout.
 
 ## Scheduler and timezone
 
-`scheduler.py` runs daily at 06:00 using the machine's local time by default:
+Pick the property timezone from the second-row **Timezone** dropdown in the
+staff UI. The choice takes effect as soon as it is selected - there is no
+Apply button - and pricing is re-run automatically so the table shows rates
+for the new timezone.
 
-```python
-PROPERTY_TIMEZONE = None          # local time by default
+The default is `Follow local system time`, which needs no timezone database at
+all. Named IANA zones (for example `Europe/London`) need `schedule >= 1.2.0`
+and, on Windows, the optional `tzdata` package. If the database is missing the
+UI explains what to install and keeps the local-time setting; a bad value can
+never stop a pricing run. UTC offsets shown in the dropdown are computed at
+runtime, so daylight-saving changes are handled automatically.
+
+The choice is stored in `timezone_settings.json` next to the scripts:
+
+```json
+{"timezone": "Europe/London", "schema_version": 1}
 ```
 
-Set it to an IANA name (for example `Asia/Singapore`) to pin the daily run to
-Singapore Time; that requires `schedule >= 1.2.0` and `tzdata` or `pytz`.
-With `None` the repo runs with no extra timezone dependency. The scheduled
-time is **not** automatically Singapore Time - do not assume it is.
+`"timezone": null` means local system time. This file is written only by the
+UI and is git-ignored.
+
+`schedule` accepts named timezones only as `pytz` objects. To avoid adding
+that dependency, the scheduler converts 06:00 in the selected zone into the
+equivalent machine-local wall-clock time and registers a plain daily job. It
+recomputes that time every minute, so daylight-saving transitions are picked
+up automatically without a restart.
+
+The same setting drives **all** of the following:
+
+- The unattended `scheduler.py` 06:00 run. A long-running scheduler notices a
+  configuration change within about a minute and rebuilds its job, so no
+  restart is needed.
+- The pricing engine's "today": the 90-day window, day-of-week factors,
+  days-to-check-in, the report date suffix and the timestamped fallback
+  filenames.
+- The PMS `property_now` hour, which drives the same-day discount tiers
+  (18:00 / 20:00 / 22:00). In `DEMO` mode this hour is the current wall-clock
+  time in the selected timezone, so the sample rates react to a switch too.
+
+Because the 90-day window is derived from the current property date, switching
+across the date line can move the window by one day and therefore change which
+holiday rows from `Public holidays.csv` are inside it. That is expected, not a
+calendar error.
 
 ## Generated outputs
 

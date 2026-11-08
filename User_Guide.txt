@@ -26,6 +26,21 @@ DAILY WORKFLOW
    - A confidence score (below 70 means use your own judgement too)
 5. Use the dropdowns above the table to filter by date range or room type.
 
+TIMEZONE (SECOND ROW, UNDER THE BUTTONS)
+---------------------------------------
+The "Timezone" dropdown sits on its own row just below the top buttons.
+Selecting an entry takes effect immediately - there is no Apply button - and
+pricing runs again automatically so the table matches the new timezone.
+
+The sentence on the right always shows which timezone is in use and what it
+affects: the rates, the current pricing date and the daily 06:00 run. Keep an
+eye on it; it tells you which day the prices were calculated for.
+
+The default "Follow local system time" needs no setup. Named timezones need
+the IANA timezone database; if it is missing, the app tells your administrator
+to run "pip install tzdata" and keeps the local-time setting. A change is
+picked up by a running scheduler within about a minute, with no restart.
+
 ADD OR CHANGE A SPECIAL EVENT (NO CODING NEEDED)
 -----------------------------------------------
 All public holidays and special events live in "Public holidays.csv" in the
@@ -85,8 +100,9 @@ market conditions.
 PREFER NOT TO USE THE WINDOW?
 -----------------------------
 Double-click "Run_Pricing_Now.bat" to run one pricing cycle directly.
-The daily 06:00 run happens automatically via scheduler.py (machine local
-time by default; ask your administrator about the timezone setting).
+The daily 06:00 run happens automatically via scheduler.py, in the timezone
+chosen in the staff UI (this computer's local time by default). A change is
+picked up within about a minute without restarting the scheduler.
 
 TROUBLESHOOTING
 ---------------
@@ -101,3 +117,10 @@ Q: The rate looks lower than the base rate on a holiday?
    Check the factor cards: demand, pace and same-day discounts can outweigh
    the event uplift. The Special Event card confirms the event factor was
    applied. Remember this is demo booking data.
+Q: Choosing a timezone shows "Timezone data not available"?
+   Ask your administrator to run "pip install tzdata", then reopen the
+   window. Alternatively keep "Follow local system time", which needs no
+   extra package.
+Q: The dates in the table shifted after switching timezone?
+   Expected: the 90-day window starts on the current date in the selected
+   timezone, so crossing the date line moves it by one day.

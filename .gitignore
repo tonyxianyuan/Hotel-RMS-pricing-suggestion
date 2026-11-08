@@ -12,3 +12,7 @@ __pycache__/
 # Generated pricing reports
 *_Live_Dashboard_*.csv
 *_RMS_Manager_View_*.csv
+
+# Local timezone preference (written by the staff UI)
+timezone_settings.json
+timezone_settings.json.tmp

@@ -8,6 +8,12 @@ import traceback
 
 import schedule
 
+# Make companion imports robust when this file is started from another folder.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from timezone_config import (  # noqa: E402
+    config_mtime, load_timezone, local_time_for,
+)
+
 # ==========================================
 # 1. LOGGING CONFIGURATION
 # ==========================================
@@ -30,14 +36,12 @@ console_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 
 # ==========================================
-# 1.4 RUN TIME / TIMEZONE (configurable)
+# 1.4 RUN TIME / TIMEZONE (shared setting)
 # ==========================================
-# Daily 06:00 run, using the machine's local time by default. No region is
-# named and no external timezone database is required.
-# To pin the run to a specific timezone, set PROPERTY_TIMEZONE to an IANA name
-# (for example "Asia/Singapore"); that needs schedule >= 1.2.0 and tzdata or
-# pytz. With None the run time is machine local time, NOT automatically SGT.
-PROPERTY_TIMEZONE = None
+# The staff UI writes timezone_settings.json; this process reads it. With no
+# file the daily run follows the machine's local time and needs no timezone
+# database. Named IANA zones need schedule >= 1.2.0 plus tzdata on Windows.
+RUN_TIME = "06:00"
 
 # ==========================================
 # 1.5 PYTHON INTERPRETER RESOLVER
@@ -94,6 +98,33 @@ def run_rms_job():
 # ==========================================
 # 3. MAIN SCHEDULER LOOP
 # ==========================================
+def rebuild_schedule():
+    """Register the daily job using the timezone currently on disk.
+
+    ``schedule`` only accepts pytz objects for named timezones. To keep the
+    standard library as the only requirement, 06:00 in the property zone is
+    converted to the equivalent machine-local wall-clock time. Called on
+    startup, on settings changes and when that local time shifts, so no
+    restart is needed and daylight saving is followed automatically.
+    """
+    schedule.clear()
+    name = load_timezone()
+    local_at = local_time_for(name, 6, 0)
+    try:
+        schedule.every().day.at(local_at).do(run_rms_job)
+        logger.info(
+            "Daily run at 06:00 %s -> %s machine-local time.",
+            name or "(local system time)", local_at,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not schedule %s (%s). Falling back to %s machine-local "
+            "time.", local_at, exc, RUN_TIME,
+        )
+        schedule.clear()
+        schedule.every().day.at(RUN_TIME).do(run_rms_job)
+
+
 def main():
     parser = argparse.ArgumentParser(description="RMS Unattended Automated Scheduler")
     parser.add_argument(
@@ -107,23 +138,24 @@ def main():
         print("[INFO] '--run-now' flag detected. Executing initial run...")
         run_rms_job()
 
-    # Daily 06:00 run. A named timezone requires schedule >= 1.2.0.
-    try:
-        if PROPERTY_TIMEZONE:
-            schedule.every().day.at("06:00", PROPERTY_TIMEZONE).do(run_rms_job)
-        else:
-            schedule.every().day.at("06:00").do(run_rms_job)
-        print("[INFO] Scheduled RMS to run daily at 06:00 (local / property time).")
-    except schedule.ScheduleValueError:
-        print(
-            "[WARN] Timezone parsing failed. Defaulting to local system time. "
-            "Please ensure the system clock matches the property timezone."
-        )
-        schedule.every().day.at("06:00").do(run_rms_job)
+    rebuild_schedule()
 
     print("[INFO] Scheduler is running in the background. Press Ctrl+C to exit.")
 
+    last_mtime = config_mtime()
+    last_local_at = local_time_for(load_timezone(), 6, 0)
     while True:
+        current_mtime = config_mtime()
+        name = load_timezone()
+        current_local_at = local_time_for(name, 6, 0)
+        if current_mtime != last_mtime or current_local_at != last_local_at:
+            last_mtime = current_mtime
+            last_local_at = current_local_at
+            logger.info(
+                "Timezone settings or daylight-saving offset changed; "
+                "rebuilding the daily schedule."
+            )
+            rebuild_schedule()
         schedule.run_pending()
         time.sleep(60)  # Check every 60 seconds to save CPU cycles.
 
