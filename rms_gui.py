@@ -3,12 +3,14 @@
 Hotel Pricing Assistant - Staff UI
 ==============================================
 A one-click pricing tool for non-technical staff:
-1. Click "Run Pricing Now" to run the hotel rms.py pricing engine.
-2. When finished, the results table loads automatically (recommended rates,
-   demand status, suggested action).
+1. Click "Run Pricing Now" to run the pricing engine.
+2. The results table loads automatically with recommended rates for the
+   next 90 days, per room type, demand status and suggested action.
 3. Click any row to see a plain-English breakdown of WHY that price was set.
+4. Click "Open Event Calendar" to add or edit public holidays and special
+   events in the CSV, then run pricing again. No code changes are needed.
 
-Launch: double-click Start_Pricing_UI.bat
+All UI labels, log messages, comments and report text are English.
 """
 
 import csv
@@ -18,6 +20,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from datetime import datetime
 from tkinter import ttk, messagebox
 
@@ -26,14 +29,15 @@ from tkinter import ttk, messagebox
 # ==========================================
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 RMS_SCRIPT = os.path.join(APP_DIR, "hotel rms.py")
+CALENDAR_FILE = os.path.join(APP_DIR, "Public holidays.csv")
 
 DOW_EN = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
 
 
 def read_csv_rows(path):
     """Read a CSV file into a list of dicts (stdlib only, no pandas needed)."""
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        return list(csv.DictReader(f))
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        return list(csv.DictReader(handle))
 
 
 def find_latest_csv(pattern):
@@ -80,24 +84,31 @@ def load_latest_results():
         except ValueError:
             pace = None
 
-        records.append({
-            "Stay_Date": stay,
-            "DOW": dow,
-            "Room_Type": row.get("Room_Type", ""),
-            "Final_ADR": row.get("Final_ADR", ""),
-            "Base_ADR": tech.get("Base_Room_ADR", ""),
-            "Change": row.get("ADR_Change_vs_Base", ""),
-            "Demand": row.get("Demand_Status", ""),
-            "Action": row.get("Action", ""),
-            "Occ": row.get("Current_Occupancy", ""),
-            "Confidence": row.get("Confidence_Score", ""),
-            "Reason": row.get("Reason", ""),
-            "Event": tech.get("Event_Name", "None"),
-            "Days_to_Checkin": days_ahead,
-            "Pace_Ratio": pace,
-            "Competitor_ADR": tech.get("Competitor_ADR", ""),
-            "RevPAR": tech.get("Expected_RevPAR", ""),
-        })
+        records.append(
+            {
+                "Stay_Date": stay,
+                "DOW": dow,
+                "Room_Type": row.get("Room_Type", ""),
+                "Final_ADR": row.get("Final_ADR", ""),
+                "Base_ADR": tech.get("Base_Room_ADR", ""),
+                "Change": row.get("ADR_Change_vs_Base", ""),
+                "Demand": row.get("Demand_Status", ""),
+                "Action": row.get("Action", ""),
+                "Occ": row.get("Current_Occupancy", ""),
+                "Confidence": row.get("Confidence_Score", ""),
+                "Reason": row.get("Reason", ""),
+                "Event": tech.get("Event_Name") or "",
+                "Event_Factor": tech.get("Event_Factor", ""),
+                "Event_Category": tech.get("Event_Category", ""),
+                "Event_Source": tech.get("Event_Source", ""),
+                "Rate_Cap_Applied": tech.get("Rate_Cap_Applied", ""),
+                "Data_Mode": tech.get("Data_Mode") or row.get("Data_Mode", ""),
+                "Days_to_Checkin": days_ahead,
+                "Pace_Ratio": pace,
+                "Competitor_ADR": tech.get("Competitor_ADR", ""),
+                "RevPAR": tech.get("Expected_RevPAR", ""),
+            }
+        )
     records.sort(key=lambda r: (r["Stay_Date"], r["Room_Type"]))
     return records
 
@@ -106,8 +117,8 @@ def parse_change_pct(change_str):
     """Parse '+12.5%' / '-8.3%' into a float; return None on failure."""
     if not change_str:
         return None
-    m = re.match(r"([+-]?\d+\.?\d*)%", change_str.strip())
-    return float(m.group(1)) if m else None
+    match = re.match(r"([+-]?\d+\.?\d*)%", change_str.strip())
+    return float(match.group(1)) if match else None
 
 
 # ==========================================
@@ -139,43 +150,68 @@ class RMSApp:
         self.build_detail_panel()
         self.build_status_bar()
 
-        # Check the runtime environment in the background on startup
+        # Check the runtime environment in the background on startup.
         threading.Thread(target=self.check_environment, daemon=True).start()
 
-    # ---------- Top bar: run button + filters ----------
+    # ---------- Top bar: actions, filters, data-mode warning ----------
     def build_top_bar(self):
         top = ttk.Frame(self.root, padding=(12, 10, 12, 4))
         top.pack(fill="x")
 
-        self.run_btn = ttk.Button(top, text="▶  Run Pricing Now", style="Run.TButton",
-                                  command=self.run_pricing)
+        self.run_btn = ttk.Button(
+            top, text="Run Pricing Now", style="Run.TButton", command=self.run_pricing
+        )
         self.run_btn.pack(side="left")
+
+        ttk.Button(
+            top, text="Open Event Calendar", command=self.open_event_calendar
+        ).pack(side="left", padx=(12, 0))
 
         ttk.Label(top, text="   Show:").pack(side="left")
         self.range_var = tk.StringVar(value="Next 14 days")
-        cb = ttk.Combobox(top, textvariable=self.range_var, state="readonly",
-                          width=12, values=["Next 7 days", "Next 14 days",
-                                            "Next 30 days", "All 90 days"])
+        cb = ttk.Combobox(
+            top,
+            textvariable=self.range_var,
+            state="readonly",
+            width=12,
+            values=["Next 7 days", "Next 14 days", "Next 30 days", "All 90 days"],
+        )
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", lambda e: self.populate_table())
 
         ttk.Label(top, text="   Room type:").pack(side="left")
         self.type_var = tk.StringVar(value="All room types")
-        self.type_cb = ttk.Combobox(top, textvariable=self.type_var, state="readonly",
-                                    width=14, values=["All room types"])
+        self.type_cb = ttk.Combobox(
+            top,
+            textvariable=self.type_var,
+            state="readonly",
+            width=14,
+            values=["All room types"],
+        )
         self.type_cb.pack(side="left")
         self.type_cb.bind("<<ComboboxSelected>>", lambda e: self.populate_table())
 
-        self.last_run_lbl = ttk.Label(top, text="(Not run yet - click the button to start)",
-                                      foreground="#666666")
-        self.last_run_lbl.pack(side="right")
+        self.mode_lbl = ttk.Label(
+            top, text="", foreground="#b26a00", font=("Segoe UI", 9, "bold")
+        )
+        self.mode_lbl.pack(side="right")
+        self.last_run_lbl = ttk.Label(
+            top,
+            text="(Not run yet - click the button to start)",
+            foreground="#666666",
+        )
+        self.last_run_lbl.pack(side="right", padx=(0, 12))
 
     # ---------- Middle: results table ----------
     def build_table(self):
-        cols = ("date", "dow", "type", "final", "change", "demand", "action",
-                "occ", "conf", "reason")
-        headers = ("Date", "Day", "Room Type", "Recommended Rate", "vs Base",
-                   "Demand", "Suggested Action", "Occupancy", "Confidence", "Pricing Reason")
+        cols = (
+            "date", "dow", "type", "final", "change", "demand",
+            "action", "occ", "conf", "reason",
+        )
+        headers = (
+            "Date", "Day", "Room Type", "Recommended Rate", "vs Base",
+            "Demand", "Suggested Action", "Occupancy", "Confidence", "Pricing Reason",
+        )
         widths = (95, 55, 85, 115, 80, 100, 120, 80, 80, 330)
 
         frame = ttk.Frame(self.root, padding=(12, 4))
@@ -191,7 +227,7 @@ class RMSApp:
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
-        # Row colors by demand status
+        # Row colors by demand status.
         self.tree.tag_configure("Peak", background="#fde2e2")
         self.tree.tag_configure("High", background="#fff3e0")
         self.tree.tag_configure("Low", background="#e8f5e9")
@@ -199,45 +235,61 @@ class RMSApp:
 
     # ---------- Bottom: pricing explanation panel ----------
     def build_detail_panel(self):
-        panel = ttk.LabelFrame(self.root, text=" Why this price? (click any row above) ",
-                               padding=(14, 6, 14, 10))
+        panel = ttk.LabelFrame(
+            self.root,
+            text=" Why this price? (click any row above) ",
+            padding=(14, 6, 14, 10),
+        )
         panel.pack(fill="x", padx=12, pady=(2, 4))
         self.detail = panel
 
-        # Row 1: headline conclusion
-        self.summary_lbl = ttk.Label(panel, text="← Click a row in the table above to see the pricing explanation",
-                                     style="Big.TLabel", foreground="#555555", wraplength=1100,
-                                     justify="left")
+        self.summary_lbl = ttk.Label(
+            panel,
+            text="Click a row in the table above to see the pricing explanation",
+            style="Big.TLabel",
+            foreground="#555555",
+            wraplength=1100,
+            justify="left",
+        )
         self.summary_lbl.grid(row=0, column=0, columnspan=6, sticky="w", pady=(2, 6))
 
-        # Row 2: base vs recommended rate comparison bars
         self.canvas = tk.Canvas(panel, width=1050, height=64, highlightthickness=0)
         self.canvas.grid(row=1, column=0, columnspan=6, sticky="w")
 
-        # Row 3: factor cards (5)
+        titles = [
+            "Special Event",
+            "Supply & Demand",
+            "Booking Pace",
+            "Competitor",
+            "Forecast RevPAR",
+        ]
         self.factor_vars = []
-        titles = ["📅 Special Event", "🏨 Supply & Demand", "📈 Booking Pace",
-                  "🥊 Competitor", "🎯 Forecast RevPAR"]
-        for i, t in enumerate(titles):
-            f = ttk.Frame(panel)
-            f.grid(row=2, column=i, sticky="nw", padx=(0, 24), pady=(4, 2))
-            ttk.Label(f, text=t, foreground="#1a6fb5",
-                      font=("Segoe UI", 9, "bold")).pack(anchor="w")
-            v = tk.Text(f, width=18, height=3, wrap="word", relief="flat",
-                        background="#f5f7fa", font=("Segoe UI", 9))
-            v.configure(state="disabled")
-            v.pack(anchor="w", pady=2)
-            self.factor_vars.append(v)
+        for i, title in enumerate(titles):
+            frame = ttk.Frame(panel)
+            frame.grid(row=2, column=i, sticky="nw", padx=(0, 24), pady=(4, 2))
+            ttk.Label(
+                frame,
+                text=title,
+                foreground="#1a6fb5",
+                font=("Segoe UI", 9, "bold"),
+            ).pack(anchor="w")
+            box = tk.Text(
+                frame, width=18, height=3, wrap="word", relief="flat",
+                background="#f5f7fa", font=("Segoe UI", 9),
+            )
+            box.configure(state="disabled")
+            box.pack(anchor="w", pady=2)
+            self.factor_vars.append(box)
 
-        # Row 4: confidence note
         self.conf_lbl = ttk.Label(panel, text="", foreground="#666666")
         self.conf_lbl.grid(row=3, column=0, columnspan=6, sticky="w", pady=(2, 0))
 
     # ---------- Bottom: status log ----------
     def build_status_bar(self):
-        self.status = tk.Text(self.root, height=4, relief="flat", background="#20232a",
-                              foreground="#9fe88d", font=("Consolas", 9),
-                              state="disabled")
+        self.status = tk.Text(
+            self.root, height=4, relief="flat", background="#20232a",
+            foreground="#9fe88d", font=("Consolas", 9), state="disabled",
+        )
         self.status.pack(fill="x", padx=12, pady=(0, 10))
 
     def log(self, msg):
@@ -248,18 +300,66 @@ class RMSApp:
 
     # ---------- Environment check ----------
     def check_environment(self):
+        if not os.path.isfile(CALENDAR_FILE):
+            self.root.after(
+                0,
+                lambda: self.log(
+                    "[WARN] Event calendar not found: {}. The pricing run will stop "
+                    "until the file is restored.".format(CALENDAR_FILE)
+                ),
+            )
         try:
-            r = subprocess.run([sys.executable, "-c", "import pandas, numpy, requests"],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode == 0:
-                self.root.after(0, lambda: self.log("✅ Environment check passed (pandas / numpy / requests ready)"))
+            result = subprocess.run(
+                [sys.executable, "-c", "import pandas, numpy, requests"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode == 0:
+                self.root.after(
+                    0,
+                    lambda: self.log(
+                        "[OK] Environment check passed (pandas / numpy / requests ready)"
+                    ),
+                )
             else:
-                self.root.after(0, lambda: self.log(
-                    "⚠️ Missing Python packages (pandas / numpy / requests).\n"
-                    "   To fix: press Win+R, type cmd, then run\n"
-                    f"   \"{sys.executable}\" -m pip install pandas numpy requests"))
-        except Exception as e:
-            self.root.after(0, lambda: self.log(f"⚠️ Environment check failed: {e}"))
+                self.root.after(
+                    0,
+                    lambda: self.log(
+                        "[WARN] Missing Python packages (pandas / numpy / requests).\n"
+                        "       To fix: press Win+R, type cmd, then run\n"
+                        '       "{}" -m pip install pandas numpy requests'.format(
+                            sys.executable
+                        )
+                    ),
+                )
+        except Exception as exc:
+            self.root.after(
+                0, lambda: self.log("[WARN] Environment check failed: {}".format(exc))
+            )
+
+    # ---------- Event calendar ----------
+    def open_event_calendar(self):
+        """Open the staff-maintained calendar in the default CSV application."""
+        if not os.path.isfile(CALENDAR_FILE):
+            messagebox.showerror(
+                "Calendar Not Found",
+                "Could not find:\n{}\n\nThe pricing engine requires this file.".format(
+                    CALENDAR_FILE
+                ),
+            )
+            return
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(CALENDAR_FILE)
+            else:
+                webbrowser.open("file:///" + CALENDAR_FILE.replace("\\", "/"))
+        except OSError as exc:
+            messagebox.showerror("Cannot Open Calendar", str(exc))
+            return
+        self.log(
+            "[INFO] Event calendar opened. Save your edits, then click Run Pricing Now."
+        )
 
     # ---------- Run pricing ----------
     def run_pricing(self):
@@ -267,16 +367,26 @@ class RMSApp:
             return
         self.running = True
         self.run_btn.configure(state="disabled")
-        self.log(f"▶ {datetime.now():%H:%M:%S}  Running pricing engine, please wait (usually 10-30 seconds)...")
+        self.log(
+            "[RUN] {} Running pricing engine, please wait...".format(
+                datetime.now().strftime("%H:%M:%S")
+            )
+        )
 
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
         try:
             proc = subprocess.Popen(
                 [sys.executable, RMS_SCRIPT],
-                cwd=APP_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", env=env)
-        except Exception as e:
-            self.log(f"❌ Failed to start pricing engine: {e}")
+                cwd=APP_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+        except Exception as exc:
+            self.log("[ERROR] Failed to start pricing engine: {}".format(exc))
             self.running = False
             self.run_btn.configure(state="normal")
             return
@@ -293,21 +403,26 @@ class RMSApp:
         self.running = False
         self.run_btn.configure(state="normal")
         if code == 0:
-            self.log("✅ Pricing finished, loading results...")
+            self.log("[OK] Pricing finished, loading results...")
             self.load_results()
         else:
-            self.log("❌ Pricing engine failed. Check the log above or contact your system administrator.")
+            self.log(
+                "[ERROR] Pricing engine failed. Check the log above or contact "
+                "your system administrator."
+            )
 
     # ---------- Load / display results ----------
     def load_results(self):
         try:
             records = load_latest_results()
-        except Exception as e:
-            messagebox.showerror("Load Failed", f"Error reading result files:\n{e}")
+        except Exception as exc:
+            messagebox.showerror("Load Failed", "Error reading result files:\n{}".format(exc))
             return
         if not records:
-            messagebox.showwarning("No Results",
-                                   "No pricing result files found.\nPlease click \"Run Pricing Now\" first.")
+            messagebox.showwarning(
+                "No Results",
+                'No pricing result files found.\nPlease click "Run Pricing Now" first.',
+            )
             return
 
         self.records = records
@@ -315,9 +430,33 @@ class RMSApp:
         self.type_cb.configure(values=types)
         self.type_var.set("All room types")
         self.populate_table()
+        self.update_mode_banner()
         self.last_run_lbl.configure(
-            text=f"Data generated: {datetime.now():%Y-%m-%d %H:%M}")
-        self.log(f"✅ Loaded {len(records)} rate recommendations. Click any row to see why it was priced this way.")
+            text="Data generated: {}".format(datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
+        self.log(
+            "[INFO] Loaded {} rate recommendations. Click any row to see why it "
+            "was priced this way.".format(len(records))
+        )
+
+    def update_mode_banner(self):
+        """Make the demo/production distinction impossible to overlook."""
+        modes = {str(r.get("Data_Mode") or "") for r in self.records}
+        if modes == {"DEMO"}:
+            self.mode_lbl.configure(
+                text="DEMO MODE - synthetic data, not for live pricing",
+                foreground="#b26a00",
+            )
+        elif modes == {"LIVE_PMS_SYNTHETIC_MARKET"}:
+            self.mode_lbl.configure(
+                text="LIVE PMS / SYNTHETIC MARKET DATA",
+                foreground="#b26a00",
+            )
+        else:
+            self.mode_lbl.configure(
+                text="DATA MODE UNKNOWN - verify the report",
+                foreground="#b00020",
+            )
 
     def filtered_records(self):
         rng = self.range_var.get()
@@ -335,22 +474,43 @@ class RMSApp:
     def populate_table(self):
         self.tree.delete(*self.tree.get_children())
         for r in self.filtered_records():
-            tag = {"Peak Demand": "Peak", "High Demand": "High",
-                   "Low Demand": "Low"}.get(r["Demand"], "")
-            self.tree.insert("", "end", values=(
-                r["Stay_Date"], r["DOW"], r["Room_Type"], r["Final_ADR"],
-                r["Change"], r["Demand"], r["Action"], r["Occ"],
-                r["Confidence"], r["Reason"]), tags=(tag,))
+            tag = {
+                "Peak Demand": "Peak",
+                "High Demand": "High",
+                "Low Demand": "Low",
+            }.get(r["Demand"], "")
+            self.tree.insert(
+                "", "end",
+                values=(
+                    r["Stay_Date"], r["DOW"], r["Room_Type"], r["Final_ADR"],
+                    r["Change"], r["Demand"], r["Action"], r["Occ"],
+                    r["Confidence"], r["Reason"],
+                ),
+                tags=(tag,),
+            )
 
     # ---------- Row click -> pricing explanation ----------
     def on_row_select(self, _event):
         sel = self.tree.selection()
         if not sel:
             return
-        r = self.records[self.tree.index(sel[0])] if self.records else None
-        if r is None:
+        index = self.tree.index(sel[0])
+        # The table can be filtered, so map the visible row back to its record
+        # by the date / room type values rather than by positional index.
+        values = self.tree.item(sel[0], "values")
+        if not values:
             return
-        self.show_detail(r)
+        match = next(
+            (
+                r for r in self.records
+                if r["Stay_Date"] == values[0] and r["Room_Type"] == values[2]
+            ),
+            None,
+        )
+        if match is None and index < len(self.records):
+            match = self.records[index]
+        if match is not None:
+            self.show_detail(match)
 
     def set_factor(self, idx, text):
         box = self.factor_vars[idx]
@@ -360,24 +520,27 @@ class RMSApp:
         box.configure(state="disabled")
 
     def show_detail(self, r):
-        # 1) Headline conclusion
+        # 1) Headline conclusion.
         pct = parse_change_pct(r["Change"])
         if pct is None:
             direction = "held at base rate"
         elif pct >= 25:
-            direction = f"raised sharply by {pct:+.1f}%"
+            direction = "raised sharply by {:+.1f}%".format(pct)
         elif pct >= 10:
-            direction = f"raised by {pct:+.1f}%"
+            direction = "raised by {:+.1f}%".format(pct)
         elif pct > -10:
-            direction = f"roughly flat ({pct:+.1f}%)"
+            direction = "roughly flat ({:+.1f}%)".format(pct)
         else:
-            direction = f"lowered by {pct:+.1f}%"
+            direction = "lowered by {:+.1f}%".format(pct)
         self.summary_lbl.configure(
-            text=f"{r['Stay_Date']} ({r['DOW']}) {r['Room_Type']}: recommended rate ${r['Final_ADR']}, {direction}. "
-                 f"Key driver: {r['Reason']}.",
-            foreground="#c0392b" if pct is not None and pct >= 10 else "#1a6fb5")
+            text="{} ({}) {}: recommended rate ${}, {}. Key driver: {}.".format(
+                r["Stay_Date"], r["DOW"], r["Room_Type"],
+                r["Final_ADR"], direction, r["Reason"],
+            ),
+            foreground="#c0392b" if pct is not None and pct >= 10 else "#1a6fb5",
+        )
 
-        # 2) Base vs recommended comparison bars
+        # 2) Base vs recommended comparison bars.
         self.canvas.delete("all")
         try:
             base = float(r["Base_ADR"])
@@ -385,73 +548,104 @@ class RMSApp:
         except (TypeError, ValueError):
             base = final = None
         if base and final:
-            W, y = 1000, 12
-            hi = max(base, final) * 1.15
-            scale = W / hi
-            # Base rate bar (grey)
-            self.canvas.create_rectangle(10, y, 10 + base * scale, y + 16,
-                                         fill="#b0bec5", outline="")
-            self.canvas.create_text(10 + base * scale + 8, y + 8, anchor="w",
-                                    text=f"Base rate ${base:.0f}", font=("Segoe UI", 9),
-                                    fill="#555555")
-            # Recommended rate bar (red if higher, green if lower)
+            width, y = 1000, 12
+            high = max(base, final) * 1.15
+            scale = width / high
+            self.canvas.create_rectangle(
+                10, y, 10 + base * scale, y + 16, fill="#b0bec5", outline=""
+            )
+            self.canvas.create_text(
+                10 + base * scale + 8, y + 8, anchor="w",
+                text="Base rate ${:.0f}".format(base),
+                font=("Segoe UI", 9), fill="#555555",
+            )
             color = "#e74c3c" if final >= base else "#27ae60"
-            self.canvas.create_rectangle(10, y + 28, 10 + final * scale, y + 44,
-                                         fill=color, outline="")
-            self.canvas.create_text(10 + final * scale + 8, y + 36, anchor="w",
-                                    text=f"Recommended ${final:.0f}", font=("Segoe UI", 9, "bold"),
-                                    fill=color)
+            self.canvas.create_rectangle(
+                10, y + 28, 10 + final * scale, y + 44, fill=color, outline=""
+            )
+            self.canvas.create_text(
+                10 + final * scale + 8, y + 36, anchor="w",
+                text="Recommended ${:.0f}".format(final),
+                font=("Segoe UI", 9, "bold"), fill=color,
+            )
 
-        # 3) Factor cards
-        event = r["Event"]
-        self.set_factor(0, "No special event" if event in ("None", "") else
-                        f"{event}\n→ Event demand uplift applied")
+        # 3) Factor cards.
+        event = str(r.get("Event") or "").strip()
+        factor = str(r.get("Event_Factor") or "").strip() or "1.00"
+        guarded = str(r.get("Rate_Cap_Applied") or "").strip().lower() in (
+            "true", "1", "yes",
+        )
+        if event:
+            event_txt = "{}\nFactor: {}x".format(event, factor)
+        else:
+            event_txt = "No special event\nFactor: {}x".format(factor)
+        if guarded:
+            event_txt += "\nRate guard was applied"
+        self.set_factor(0, event_txt)
 
         occ, pace = r["Occ"], r["Pace_Ratio"]
-        supply = f"Current occupancy {occ}"
+        supply = "Current occupancy {}".format(occ)
         if pace is not None:
             if pace > 1.2:
-                supply += f"\nBooking pace {(pace - 1) * 100:.0f}% faster than historical → hot, raise rate"
+                supply += "\nBooking pace {:.0f}% faster than history -> hot, raise rate".format(
+                    (pace - 1) * 100
+                )
             elif pace < 0.8:
-                supply += f"\nBooking pace {(1 - pace) * 100:.0f}% slower than historical → quiet, consider discount"
+                supply += "\nBooking pace {:.0f}% slower than history -> quiet, consider discount".format(
+                    (1 - pace) * 100
+                )
             else:
-                supply += "\nBooking pace in line with history → hold rate"
+                supply += "\nBooking pace in line with history -> hold rate"
         self.set_factor(1, supply)
 
         ahead = r["Days_to_Checkin"]
-        self.set_factor(2,
-                        f"{ahead} days until check-in" if isinstance(ahead, int) else "Lead time unknown")
+        self.set_factor(
+            2,
+            "{} days until check-in".format(ahead)
+            if isinstance(ahead, int)
+            else "Lead time unknown",
+        )
 
         try:
             comp = float(r["Competitor_ADR"])
             base_v = float(r["Base_ADR"])
             diff = comp - base_v
             if diff > 0:
-                comp_txt = (f"Competitor avg ${comp:.0f}\n"
-                            f"${diff:.0f} above our base → room to raise")
+                comp_txt = (
+                    "Competitor avg ${:.0f}\n${:.0f} above our base -> room to raise".format(
+                        comp, diff
+                    )
+                )
             else:
-                comp_txt = (f"Competitor avg ${comp:.0f}\n"
-                            f"${abs(diff):.0f} below our base → stay competitive")
+                comp_txt = (
+                    "Competitor avg ${:.0f}\n${:.0f} below our base -> stay competitive".format(
+                        comp, abs(diff)
+                    )
+                )
         except (TypeError, ValueError):
             comp_txt = "No competitor data"
         self.set_factor(3, comp_txt)
 
-        self.set_factor(4, f"${r['RevPAR']}" if r["RevPAR"] else "N/A")
+        self.set_factor(4, "${}".format(r["RevPAR"]) if r["RevPAR"] else "N/A")
 
-        # 4) Confidence note
+        # 4) Confidence note.
         try:
             conf = int(float(r["Confidence"]))
             self.conf_lbl.configure(
-                text=f"System confidence for this recommendation: {conf}/100"
-                     + (" (strong data basis - safe to apply)" if conf >= 70 else
-                        " (moderate data basis - use your judgement)"))
+                text="System confidence for this recommendation: {}/100".format(conf)
+                + (
+                    " (strong data basis - safe to apply)"
+                    if conf >= 70
+                    else " (moderate data basis - use your judgement)"
+                )
+            )
         except (TypeError, ValueError):
             self.conf_lbl.configure(text="")
 
 
 def main():
     root = tk.Tk()
-    app = RMSApp(root)
+    RMSApp(root)
     root.mainloop()
 
 
