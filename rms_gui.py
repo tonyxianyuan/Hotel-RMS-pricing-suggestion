@@ -51,16 +51,75 @@ def read_csv_rows(path):
         return list(csv.DictReader(handle))
 
 
-def find_latest_csv(pattern):
+def find_latest_csv(pattern, folder=None):
     """Find the newest result CSV matching the filename pattern."""
+    folder = folder or APP_DIR
     candidates = []
-    for name in os.listdir(APP_DIR):
+    for name in os.listdir(folder):
         if re.match(pattern, name):
-            full = os.path.join(APP_DIR, name)
+            full = os.path.join(folder, name)
             candidates.append((os.path.getmtime(full), full))
     if not candidates:
         return None
     return max(candidates)[1]
+
+
+def latest_report_timestamp():
+    """Return when the newest manager report was actually written, or None.
+
+    The label must describe the data on screen, not the moment the user
+    happened to click a button.
+    """
+    path = find_latest_csv(r".*_RMS_Manager_View_\d{4}-\d{2}-\d{2}.*\.csv")
+    if not path:
+        return None
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(path)).astimezone()
+    except OSError:
+        return None
+
+
+def report_pair_mismatch(folder=None):
+    """Return a message when the newest tech/manager reports differ in run.
+
+    The pair is located independently (newest of each), so two runs on the
+    same day can leave a stale half behind. Reporting it is better than
+    silently showing a price from one run with factors from another.
+    """
+    tech_path = find_latest_csv(
+        r".*_Live_Dashboard_\d{4}-\d{2}-\d{2}.*\.csv", folder)
+    mgr_path = find_latest_csv(
+        r".*_RMS_Manager_View_\d{4}-\d{2}-\d{2}.*\.csv", folder)
+    if not tech_path or not mgr_path:
+        return None
+    try:
+        tech_rows = read_csv_rows(tech_path)
+        mgr_rows = read_csv_rows(mgr_path)
+    except OSError:
+        return None
+    if not tech_rows or not mgr_rows:
+        return None
+    tech_stamp = tech_rows[0].get("Run_Timestamp", "")
+    mgr_stamp = mgr_rows[0].get("Run_Timestamp", "")
+    if tech_stamp and mgr_stamp and tech_stamp != mgr_stamp:
+        return (
+            "The two reports on screen come from different runs "
+            "(technical {}, manager {}). Click Run Pricing Now again.".format(
+                tech_stamp, mgr_stamp)
+        )
+    return None
+
+
+def build_engine_env():
+    """Build the child environment, dropping back-test overrides.
+
+    A replay left in the shell must never make the UI present a historical
+    report as today's recommendation.
+    """
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    for key in ("RMS_AS_OF_DATE", "RMS_AS_OF_DATETIME"):
+        env.pop(key, None)
+    return env
 
 
 def load_latest_results():
@@ -472,7 +531,7 @@ class RMSApp:
             )
         )
 
-        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        env = build_engine_env()
         try:
             proc = subprocess.Popen(
                 [sys.executable, RMS_SCRIPT],
@@ -533,8 +592,14 @@ class RMSApp:
         self.type_var.set("All room types")
         self.populate_table()
         self.update_mode_banner()
+        mismatch = report_pair_mismatch()
+        if mismatch:
+            self.log("[WARN] {}".format(mismatch))
+        generated = latest_report_timestamp()
         self.last_run_lbl.configure(
-            text="Data generated: {}".format(format_clock(resolve_now(load_timezone())))
+            text="Data generated: {}".format(
+                format_clock(generated) if generated else "unknown"
+            )
         )
         self.log(
             "[INFO] Loaded {} rate recommendations. Click any row to see why it "
@@ -553,6 +618,11 @@ class RMSApp:
             self.mode_lbl.configure(
                 text="LIVE PMS / SYNTHETIC MARKET DATA",
                 foreground="#b26a00",
+            )
+        elif modes == {"PMS_FALLBACK_SYNTHETIC_MARKET"}:
+            self.mode_lbl.configure(
+                text="PMS UNAVAILABLE - synthetic fallback, do not publish",
+                foreground="#b00020",
             )
         else:
             self.mode_lbl.configure(

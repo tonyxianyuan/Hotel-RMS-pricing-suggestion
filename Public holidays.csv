@@ -14,8 +14,11 @@
 #   Date          YYYY/MM/DD with a four-digit year (no MM-DD shorthand).
 #   Event_Name    Free text shown in reports; may be left empty.
 #   Event_Factor  Demand multiplier: 1.00 = neutral, 1.25 = +25%, 0.90 = -10%.
-#                 Must be greater than 0. Usual range 0.50 - 3.00; values
-#                 outside it still load but produce a [WARN] line.
+#                 Must be a real number greater than 0. A blank, NaN or
+#                 infinite value is rejected and stops the run, because a
+#                 broken factor must never be read as "no event". Usual range
+#                 0.50 - 3.00; values outside it load with a [WARN] line, and
+#                 anything above 5.00 is also flagged as a likely typo.
 #   Category      Public Holiday | Special Event | School Holiday | Custom
 #   Recurring     Y = repeat every year; N/blank = one-off
 #
@@ -27,7 +30,13 @@
 #   - Among rows of the SAME kind, the last row in the file wins.
 #   - A missing or invalid file stops the run with an error and a line number.
 #   - If a covered year has no event rows at all, the run prints a warning.
-#     Recurring rows expanded into that year count toward it.
+#   - If a covered year has only recurring rows, the run warns that movable
+#     holidays (Chinese New Year, Easter, a motor race) are missing: those
+#     dates would otherwise be priced as ordinary days.
+#   - If the same date is loaded twice with two different factors, the last
+#     row wins and the run prints a warning naming both lines.
+#   - The engine never prices a night above 4.00x the room's base rate, even
+#     if a factor here is far larger. That cap is written to the run log.
 #
 # Excel note
 #   This file is plain ASCII text. Excel may reformat a date cell using your

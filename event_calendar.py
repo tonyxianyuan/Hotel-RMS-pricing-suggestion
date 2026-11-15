@@ -21,6 +21,9 @@ Recurring=Y ignores the written year and repeats the month/day every year;
 otherwise the full date is priced once. There is no MM-DD shorthand, so every
 row shows a complete date and no locale-dependent "month/day" notation.
 
+A blank, NaN or infinite Event_Factor is rejected: those values cannot be
+priced and silently treating them as "no event" would under-price a peak day.
+
 This module is independent of the pricing engine so it can be tested alone.
 All identifiers, comments, messages and exceptions are English.
 """
@@ -28,6 +31,7 @@ All identifiers, comments, messages and exceptions are English.
 from __future__ import annotations
 
 import csv
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -38,6 +42,17 @@ import pandas as pd
 
 CATEGORIES = ("Public Holiday", "Special Event", "School Holiday", "Custom")
 DEFAULT_CATEGORY = "Special Event"
+
+# Event_Factor guidance. A value outside the usual band still loads, because a
+# genuine once-in-a-decade event may justify it, but the run says so loudly.
+# Above the hard maximum the value is almost certainly a data-entry error, so
+# the warning names the accepted maximum instead of only the usual range. The
+# pricing engine additionally refuses to price any night above an absolute
+# multiple of the base rate, so a mistyped factor can never inflate a rate
+# without limit.
+FACTOR_WARN_LOW = 0.50
+FACTOR_WARN_HIGH = 3.00
+FACTOR_HARD_MAX = 5.00
 EVENT_COLUMNS = [
     "Date",
     "Event_Name",
@@ -173,26 +188,83 @@ def _category_of(raw: object, line_no: int, warnings: list[str]) -> str:
 def annual_review_warnings(
     data: CalendarData, window_start, window_end
 ) -> list[str]:
-    """Warn when a year covered by the window has no event rows at all.
+    """Warn when a year covered by the window looks unmaintained.
 
-    This keeps a small demonstration calendar quiet while still flagging a
-    year that has not been maintained. Recurring rows are counted, so a
-    calendar made only of annual holidays does not produce a warning each run.
+    Two separate checks, because they catch different mistakes:
+
+    * no event rows at all for the year - the calendar was never filled in;
+    * event rows exist but none of them is a one-off row - only the fixed-date
+      recurring holidays were maintained, so movable holidays (Chinese New
+      Year, Easter, a motor race) are missing and will be priced as ordinary
+      days. Counting recurring rows as coverage is what used to hide this.
     """
     start = pd.Timestamp(window_start).date()
     end = pd.Timestamp(window_end).date()
-    covered_years = (
-        set(data.events["Date"].dt.year) if not data.events.empty else set()
-    )
     messages = []
     for year in range(start.year, end.year + 1):
-        if year not in covered_years:
+        if data.events.empty:
+            year_rows = data.events
+        else:
+            year_rows = data.events[data.events["Date"].dt.year == year]
+        if year_rows.empty:
             messages.append(
                 "No event rows cover {}. Add that year's holidays to "
                 "'Public holidays.csv' before relying on {} pricing.".format(
                     year, year
                 )
             )
+            continue
+        if not (year_rows["Event_Source"] == "One-off").any():
+            messages.append(
+                "No one-off event is dated in {}: movable holidays such as "
+                "Chinese New Year, Easter or a motor race will be priced at the "
+                "neutral 1.00 factor. Add them with Recurring=N and refresh that "
+                "list every year.".format(year)
+            )
+    return messages
+
+
+def describe_coverage(data: CalendarData, window_start, window_end) -> str:
+    """One-line summary of how much of the pricing window is event-priced."""
+    start = pd.Timestamp(window_start).date()
+    end = pd.Timestamp(window_end).date()
+    total = (end - start).days + 1
+    covered = len(data.events)
+    share = (100.0 * covered / total) if total > 0 else 0.0
+    if covered:
+        one_off = int((data.events["Event_Source"] == "One-off").sum())
+    else:
+        one_off = 0
+    return (
+        "Calendar coverage: {} of {} stay dates carry an event factor "
+        "({:.1f}%); {} recurring, {} one-off.".format(
+            covered, total, share, covered - one_off, one_off
+        )
+    )
+
+
+def _duplicate_warnings(rows: list[dict], kind: str) -> list[str]:
+    """Name every date that is loaded twice with two different factors.
+
+    The loader deliberately keeps the last row, but a silently overridden
+    factor is indistinguishable from a correct one in the report, so the
+    override is reported with both line numbers.
+    """
+    messages = []
+    seen: dict = {}
+    for record in rows:
+        key = record["Date"].date()
+        previous = seen.get(key)
+        if previous is not None and previous["Event_Factor"] != record["Event_Factor"]:
+            messages.append(
+                "Line {}: {} event on {} repeats line {} with a different factor "
+                "({} vs {}). The last row wins; delete the stale row so the "
+                "intended factor is unambiguous.".format(
+                    record["_Line"], kind, key.isoformat(), previous["_Line"],
+                    record["Event_Factor"], previous["Event_Factor"]
+                )
+            )
+        seen[key] = record
     return messages
 
 
@@ -204,7 +276,9 @@ def load_event_calendar(path: str, window_start, window_end) -> CalendarData:
     Recurring=Y rows use only their month/day and are expanded for every year
     touched by the window, so the written year is a placeholder. One-off rows
     override recurring rows on the same date; otherwise the last row for a
-    date wins. Invalid input raises CalendarError with a line number.
+    date wins. Invalid input raises CalendarError with a line number. A date
+    that is loaded twice with two different factors is reported as a warning
+    rather than silently overridden.
     """
     start = pd.Timestamp(window_start).date()
     end = pd.Timestamp(window_end).date()
@@ -239,16 +313,34 @@ def load_event_calendar(path: str, window_start, window_end) -> CalendarData:
                     line_no, path, row.get(factor_col, "")
                 )
             ) from exc
+        if not math.isfinite(factor):
+            raise CalendarError(
+                "Line {} in {}: Event_Factor '{}' is not a finite number. "
+                "Enter a real multiplier such as 1.25; a blank, NaN or infinite "
+                "factor cannot be priced, and the run has been stopped instead "
+                "of quietly pricing the date as neutral.".format(
+                    line_no, path, row.get(factor_col, "")
+                )
+            )
         if factor <= 0:
             raise CalendarError(
                 "Line {} in {}: Event_Factor must be greater than 0 (got {}).".format(
                     line_no, path, factor
                 )
             )
-        if factor > 3.0 or factor < 0.5:
+        if factor > FACTOR_WARN_HIGH or factor < FACTOR_WARN_LOW:
             warnings.append(
-                "Line {}: Event_Factor {} is outside the usual 0.50-3.00 range.".format(
-                    line_no, factor
+                "Line {}: Event_Factor {} is outside the usual {:.2f}-{:.2f} range.".format(
+                    line_no, factor, FACTOR_WARN_LOW, FACTOR_WARN_HIGH
+                )
+            )
+        if factor > FACTOR_HARD_MAX:
+            warnings.append(
+                "Line {}: Event_Factor {:.2f} exceeds the accepted maximum "
+                "{:.2f} and looks like a data-entry error. The night will still "
+                "be capped by the engine's absolute rate ceiling, so check the "
+                "row before publishing rates.".format(
+                    line_no, factor, FACTOR_HARD_MAX
                 )
             )
 
@@ -260,6 +352,9 @@ def load_event_calendar(path: str, window_start, window_end) -> CalendarData:
             "Event_Name": name,
             "Event_Factor": factor,
             "Event_Category": category,
+            # Kept for duplicate detection only; EVENT_COLUMNS drops it when
+            # the frame is built.
+            "_Line": line_no,
         }
 
         if recurring:
@@ -286,6 +381,9 @@ def load_event_calendar(path: str, window_start, window_end) -> CalendarData:
                     **record,
                 }
             )
+
+    warnings.extend(_duplicate_warnings(recurring_rows, "recurring"))
+    warnings.extend(_duplicate_warnings(one_off_rows, "one-off"))
 
     if not one_off_rows and not recurring_rows:
         warnings.append(

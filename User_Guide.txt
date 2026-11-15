@@ -17,6 +17,17 @@ rates to a booking channel. README.md, section "PMS data interface", describes
 the optional live HTTP client and the PMS_API_KEY / PMS_BASE_URL variables; no
 working PMS integration is bundled with this demo.
 
+If credentials ARE configured but the PMS cannot be reached, the report is
+marked PMS_FALLBACK_SYNTHETIC_MARKET, the banner turns red and a [WARN] is
+written to rms_run.log. Treat that report as DEMO data. The Data_Sources
+column in both reports names exactly which inputs are synthetic and which
+came from the PMS - the names Historical_ADR and Competitor_ADR are always
+synthetic in this build, even in live mode.
+
+The UI removes RMS_AS_OF_DATE and RMS_AS_OF_DATETIME before starting the
+engine, so a back-test variable left in the shell cannot make a replay
+report look like today's recommendation.
+
 DAILY WORKFLOW
 --------------
 1. Double-click "Start_Pricing_UI.bat" to open the app window.
@@ -69,8 +80,13 @@ maintain Event_Factor, Category and Recurring, not just the date.
                    (the written year is then ignored). Recurring=N or blank
                    prices one specific date only.
    - Event_Factor: 1.00 = no change, 1.25 = +25%, 0.90 = -10%.
-                   Must be greater than 0. Values outside 0.50-3.00 still
-                   work but produce a [WARN] line.
+                   Must be a real number greater than 0. A blank cell, "nan"
+                   or "inf" stops the run with a [ERROR] line instead of
+                   quietly pricing the day as ordinary. Values outside
+                   0.50-3.00 produce a [WARN]; anything above 5.00 is also
+                   flagged as a likely typo.
+                   No night is ever priced above 4.00x the room's base rate,
+                   whatever factor is written here.
    - Category:     Public Holiday, Special Event, School Holiday or Custom.
                    Unknown values are mapped to Special Event with a warning.
    - Event_Name:   May be left empty. An empty name shows the reason
@@ -90,6 +106,9 @@ Useful rules:
    - If the file is missing or a row is invalid, the run stops with a clear
      error message and a line number. The engine will not produce rates from
      an incomplete calendar.
+   - If the same date is listed twice with two different factors, the last row
+     wins but a [WARN] names both line numbers, so an accidental duplicate
+     cannot pass as a deliberate override.
 
 EXCEL DISPLAY WARNING
 ---------------------
@@ -110,9 +129,13 @@ dates, school holiday periods and observed-in-lieu holidays - and refreshed
 each year from your local official holiday calendar. The demo does not assume
 any particular country or property.
 
-The log box prints a warning if a year covered by the 90-day window has no
-event rows at all. Recurring rows expanded into that year count, so a
-calendar made only of annual holidays stays quiet.
+The log box prints how much of the window is priced by the calendar, for
+example "Calendar coverage: 5 of 90 stay dates carry an event factor". It also
+warns twice: once if a year covered by the window has no event rows at all,
+and once if that year has ONLY recurring rows. The second warning is the one
+that matters in practice - it means no movable holiday has been entered for
+that year, so Chinese New Year, Easter or a motor race would be priced like an
+ordinary Tuesday. Recurring rows no longer count as coverage.
 
 DATE FORMAT
 -----------
@@ -120,12 +143,22 @@ Dates shown in the table and in "Public holidays.csv" use YYYY/MM/DD (for
 example 2026/12/25). Report file names use YYYY-MM-DD instead, because "/"
 cannot appear in a Windows file name. If a report is open in Excel and cannot
 be overwritten, the engine saves a fallback copy named
-..._YYYY-MM-DD_HHMMSS.csv and logs a [WARN] line naming it.
+..._YYYY-MM-DD_FALLBACK.csv and logs a [WARN] line naming it. That name is
+reused on later runs, so repeated cycles never pile up extra files.
+
+RUN LOG
+-------
+Every cycle also appends its [INFO], [WARN] and [OK] lines to "rms_run.log"
+in the script folder. It is additive and stays after you close the UI, so
+PMS fallbacks, calendar warnings and report publishing problems can be
+checked later. The file is git-ignored. The technical view CSV also carries
+the individual factor columns, so a rate can be checked by multiplying
+Base_Room_ADR by the factors.
 
 REPORT RETENTION
 ----------------
 Only the 3 newest report dates stay in the script folder. Older reports,
-including the ..._YYYY-MM-DD_HHMMSS.csv fallback copies, are MOVED to an
+including the ..._YYYY-MM-DD_FALLBACK.csv copies, are MOVED to an
 "archive" subfolder - they are NOT deleted. Drag a file back out of that
 folder to restore it. Set RMS_REPORT_KEEP to change how many dates are kept.
 Set RMS_REPORT_RETENTION_DRY_RUN=1 to preview the list without moving
@@ -156,9 +189,9 @@ and stable market conditions.
 PREFER NOT TO USE THE WINDOW?
 -----------------------------
 Double-click "Run_Pricing_Now.bat" to run one pricing cycle directly. Reports
-are written to the current working directory; the .bat file switches to the
-script folder first. If you run python "hotel rms.py" manually, cd to the
-script folder first.
+are always written into the script folder, so it no longer matters which
+directory you start the engine from. The .bat file switches to the script
+folder first anyway.
 
 The daily 06:00 run is NOT automatic by itself: a scheduler process must be
 started and left running. From the script folder run
@@ -183,8 +216,9 @@ Q: Nothing happens / an error in the log?
    scheduler) are installed. Then screenshot the log box and send it to the
    administrator.
 Q: A result file is open in Excel - will it fail?
-   No. The engine saves to a fallback file named ..._YYYY-MM-DD_HHMMSS.csv
-   and logs its name. Look for that file in the script folder.
+   No. The engine saves to ..._YYYY-MM-DD_FALLBACK.csv and logs its name.
+   Look for that file in the script folder. Clicking Run again is safe: the
+   same fallback name is reused, so no extra files pile up.
 Q: Where did yesterday's report go?
    It is in the "archive" subfolder. Reports are MOVED, not deleted - drag
    the file back into the script folder if you need it in the UI again.

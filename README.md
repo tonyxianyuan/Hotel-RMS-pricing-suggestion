@@ -41,13 +41,17 @@ condensed copy of the calendar rules in its comment header.
 | `rms_gui.py` | Tkinter staff UI: run pricing, browse results, explain rates, open the calendar |
 | `scheduler.py` | Long-running scheduler for the daily 06:00 run (`--run-now` runs one cycle first, then stays resident) |
 | `timezone_config.py` | Shared timezone settings and IANA availability checks; library module, not run directly |
+| `report_writer.py` | Atomic report publishing (private temp file + one `os.replace`); library module, not run directly |
+| `report_retention.py` | Soft-delete archiving of old reports into `archive/`; library module, not run directly |
+| `price_guard.py` | Read-only pre-publish sanity checks on the priced frame; library module, not run directly |
 | `Run_Pricing_Now.bat` | Windows: run one pricing cycle |
 | `Start_Pricing_UI.bat` | Windows: open the staff UI |
 | `User_Guide.txt` | Short operator guide |
 
 The runnable entry points are `hotel rms.py` (one cycle), `rms_gui.py` (UI) and
-`scheduler.py` (resident scheduler). `event_calendar.py` and
-`timezone_config.py` are imported by those scripts and have no command-line
+`scheduler.py` (resident scheduler). `event_calendar.py`,
+`timezone_config.py`, `report_writer.py`, `report_retention.py` and
+`price_guard.py` are imported by those scripts and have no command-line
 interface. The two `.bat` files are Windows shortcuts for the first and
 second entry points.
 
@@ -145,7 +149,8 @@ box. No `pytz` dependency is required - see
 ## Quick start
 
 Run all commands from the repository directory; the `.bat` launchers do this
-for you. Reports are written to the current working directory.
+for you. Reports are always published into the **script folder**, whichever
+directory the engine was started from.
 
 ```bat
 python "hotel rms.py"          # one pricing cycle -> two CSV reports
@@ -176,7 +181,7 @@ CSV, then click **Run Pricing Now** again. No restart is needed.
 | --- | --- | --- |
 | `Date` | `YYYY/MM/DD`, e.g. `2026/12/25` | A full date with a four-digit year. With `Recurring=Y` only its month/day is used, so it repeats every year and the written year is a placeholder. Otherwise the exact date is priced once |
 | `Event_Name` | free text, may be empty | Shown in reports. If empty, the reason reads `Public Holiday Demand Window Triggered` |
-| `Event_Factor` | number > 0 | Demand multiplier: `1.00` neutral, `1.25` = +25%, `0.90` = -10%. Usual range 0.50-3.00; values outside it are still loaded but produce a `[WARN]` line |
+| `Event_Factor` | finite number > 0 | Demand multiplier: `1.00` neutral, `1.25` = +25%, `0.90` = -10%. A blank, `NaN` or infinite value stops the run instead of being read as "no event". Usual range 0.50-3.00; values outside it are loaded with a `[WARN]`, and anything above 5.00 is additionally flagged as a likely typo |
 | `Category` | `Public Holiday` / `Special Event` / `School Holiday` / `Custom` | Used in the pricing reason. Unknown values are mapped to `Special Event` with a warning |
 | `Recurring` | `Y` or `N` (blank = `N`) | `Y` repeats the same month/day every year |
 
@@ -203,11 +208,19 @@ why the shipped file can carry its own instructions.
   the date line can shift it by one day and change which calendar rows fall
   inside it. This is expected behaviour, not a calendar error.
 - A missing file, a missing `Date` / `Event_Factor` column, a bad date, a
-  non-numeric or non-positive factor stops the run with an error and a line
-  number. The engine does **not** silently fall back to demo events.
-- When a year covered by the window has no event rows at all, the run prints
-  a warning reminding staff to maintain that year's calendar. Recurring rows
-  expanded into that year count, so a calendar of annual holidays stays quiet.
+  non-numeric, non-finite or non-positive factor stops the run with an error
+  and a line number. The engine does **not** silently fall back to demo events.
+- Calendar maintenance is checked at two levels and the run reports how much
+  of the window is actually covered, for example
+  `Calendar coverage: 5 of 90 stay dates carry an event factor (5.6%)`.
+  - A year with no event rows at all warns that the year was never filled in.
+  - A year with **only** recurring rows warns that no one-off event is dated
+    there, so movable holidays (Chinese New Year, Easter, a motor race) would
+    be priced as ordinary days. Recurring placeholders no longer count as
+    coverage, which is how a forgotten movable holiday used to stay silent.
+- If the same date is loaded twice with two different factors, the last row
+  still wins, but the run prints a warning naming both line numbers so an
+  unintended override cannot pass as a correct rate.
 - Fatal vs non-fatal input problems: only malformed calendar rows abort a
   run. A bad PMS timestamp or an invalid stored timezone emits a `[WARN]`
   line and falls back to a default, so neither can block a pricing run.
@@ -249,11 +262,11 @@ same-day time-decay layer and the guest-density surcharge are defined in
 `BASELINE_ADR` configuration, not a previous release of the tool.
 
 Rate guards give event days extra headroom so a strong event factor is not
-clipped by the generic ceiling:
+clipped by the generic ceiling, but the headroom itself has a hard limit:
 
 ```text
 MIN_ADR = Base_Room_ADR x 0.70
-MAX_ADR = Base_Room_ADR x max(2.00, Event_Factor x 1.60)
+MAX_ADR = Base_Room_ADR x min(max(2.00, Event_Factor x 1.60), 4.00)
 ```
 
 With the largest shipped event factor of `1.50`, the ceiling becomes
@@ -262,6 +275,19 @@ room to affect `Final_ADR` instead of being clipped at `2.00 x Base_Room_ADR`.
 Every clipped row is flagged with `Rate_Cap_Applied` in the technical view and
 `| Rate ceiling applied` / `| Rate floor applied` in the manager view, so a
 guard hit is never hidden.
+
+The outer `4.00` is an absolute ceiling. Event headroom stays fully effective
+up to an `Event_Factor` of `2.50`; above that the cap stops growing, so a
+mistyped `15.00` can no longer turn a `135` base rate into a `2924` nightly
+rate. When the absolute ceiling binds, the run logs a `[WARN]` naming the stay
+date, the factor and the headroom that would have been allowed.
+
+Before anything is published, `price_guard.find_violations()` re-checks the
+priced frame: every price column must be finite, `Final_ADR` must sit inside
+`MIN_ADR`/`MAX_ADR` (half a currency unit of tolerance for the final rounding),
+`MAX_ADR` must exceed `MIN_ADR`, and no stay date / room type may appear twice.
+A violation stops the run with exit code `3` and writes `[ERROR]` lines to the
+log instead of publishing rates that contradict their own guard.
 
 ## Reproducibility
 
@@ -316,6 +342,14 @@ two replacement points for a real rate-shopper feed and a real historical ADR
 feed. Until those are replaced, even a live PMS connection still produces a
 partly synthetic recommendation; that is why the mode is named
 `LIVE_PMS_SYNTHETIC_MARKET` rather than `LIVE`.
+
+A configured key does not guarantee live data. Both PMS reads report what
+they actually used, and `Data_Mode` is resolved only **after** both finish.
+If either call fails, the report is marked `PMS_FALLBACK_SYNTHETIC_MARKET`,
+the UI banner turns red, and a `[WARN]` line is written to `rms_run.log`. A
+report therefore cannot claim LIVE data it did not receive. The
+`Data_Sources` column records the per-input outcome
+(`demo_synthetic` / `synthetic_fallback` / `PMS_live`).
 
 ## PMS data interface
 
@@ -384,8 +418,7 @@ The same setting drives **all** of the following:
   [Quick start](#quick-start). A running scheduler notices a configuration
   change within about a minute and rebuilds its job, so no restart is needed.
 - The pricing engine's "today": the 90-day window, day-of-week factors,
-  days-to-check-in, the report date suffix and the timestamped fallback
-  filenames.
+  days-to-check-in and the report date suffix.
 - The PMS `property_now` hour, which drives the same-day discount tiers
   (18:00 / 20:00 / 22:00). In `DEMO` mode this hour is the current wall-clock
   time in the selected timezone, so the sample rates react to a switch too.
@@ -396,24 +429,57 @@ above.
 
 ## Generated outputs
 
-Each run creates two reports in the **current working directory** (the
-launchers set this to the script folder):
+Each run creates two reports in the **script folder**, whichever directory the
+engine was started from:
 
-- `hotel_name_Live_Dashboard_YYYY-MM-DD.csv` - technical view, 20 columns:
-  `Stay_Date`, `Room_Type`, `Day_of_Week`, `Event_Name`, `Event_Category`,
-  `Event_Factor`, `Event_Source`, `Days_to_Checkin`, `Current_Occupancy`,
-  `Pace_Ratio`, `Base_Room_ADR`, `Competitor_ADR`, `Recommended_ADR`,
-  `MIN_ADR`, `MAX_ADR`, `Rate_Cap_Applied`, `Final_ADR`, `Expected_RevPAR`,
-  `Confidence_Score`, `Data_Mode`. `Recommended_ADR` is the value before
-  guarding.
-- `hotel_name_RMS_Manager_View_YYYY-MM-DD.csv` - manager view, 10 columns:
+- `hotel_name_Live_Dashboard_YYYY-MM-DD.csv` - technical view, 34 columns:
+  the original 20 (`Stay_Date`, `Room_Type`, `Day_of_Week`, `Event_Name`,
+  `Event_Category`, `Event_Factor`, `Event_Source`, `Days_to_Checkin`,
+  `Current_Occupancy`, `Pace_Ratio`, `Base_Room_ADR`, `Competitor_ADR`,
+  `Recommended_ADR`, `MIN_ADR`, `MAX_ADR`, `Rate_Cap_Applied`, `Final_ADR`,
+  `Expected_RevPAR`, `Confidence_Score`, `Data_Mode`) plus 12 audit columns:
+  `RoomType_Factor`, `Weekend_Factor`, `Effective_Occupancy`,
+  `Current_OTB_Rooms`, `Hist_OTB_At_Same_LeadTime`, `Occupancy_Factor`,
+  `Lead_Time_Factor`, `Booking_Pace_Factor`, `Competitor_Ratio`,
+  `Competitor_Factor`, `Model_ADR_Before_Adjustments`,
+  `Post_Model_Adjustment_Factor`, the provenance column `Data_Sources`, and
+  `Run_Timestamp`. `Recommended_ADR` is the value before guarding; it can be
+  reproduced by multiplying `Base_Room_ADR` by `Weekend_Factor`,
+  `Event_Factor`, `Occupancy_Factor`, `Lead_Time_Factor`,
+  `Booking_Pace_Factor`, `Competitor_Factor` and
+  `Post_Model_Adjustment_Factor`. `Model_ADR_Before_Adjustments` is that
+  product before the same-day adjustments.
+- `hotel_name_RMS_Manager_View_YYYY-MM-DD.csv` - manager view, 12 columns:
   `Stay_Date`, `Room_Type`, `Current_Occupancy`, `Final_ADR`,
   `ADR_Change_vs_Base`, `Demand_Status`, `Action`, `Confidence_Score`,
-  `Reason`, `Data_Mode`.
+  `Reason`, `Data_Mode`, `Data_Sources`, `Run_Timestamp`.
 
-Both are git-ignored. If a report is open in Excel and cannot be overwritten,
-the engine instead saves `..._YYYY-MM-DD_HHMMSS.csv` and logs a `[WARN]`
-line naming the fallback file.
+`Data_Sources` states which inputs were real:
+`baseline=constant_synthetic`, `competitor=synthetic_hash`, and `dashboard=`
+/ `reservations=` as `demo_synthetic`, `synthetic_fallback` or `PMS_live`.
+
+`Run_Timestamp` is one timestamp per cycle, written identically into both
+reports, so a consumer can prove the pair came from the same run. The UI
+compares the two values and warns when the files on screen come from
+different runs.
+
+Both are git-ignored. Reports are published atomically: each one is written to
+a private temporary file and then moved into place with a single `os.replace`.
+A reader never sees a half-written file, and several runs on the same day -
+including overlapping ones - never interleave bytes. If a report is open in
+Excel and cannot be overwritten, the engine instead publishes
+`..._YYYY-MM-DD_FALLBACK.csv` and logs a `[WARN]` line naming it. That single
+fallback name is reused by later runs, so the folder never accumulates
+timestamped copies.
+
+Every cycle also appends its `[INFO]`, `[WARN]` and `[OK]` lines to
+`rms_run.log` in the script folder. The file is additive and git-ignored, and
+it survives closing the UI - so PMS fallbacks, calendar warnings and report
+publishing problems can still be audited afterwards.
+
+The staff UI strips `RMS_AS_OF_DATE` and `RMS_AS_OF_DATETIME` before starting
+the engine, so a back-test variable left in the shell cannot make a replay
+report appear as today's recommendation.
 
 The `Stay_Date` column inside both reports uses `YYYY/MM/DD`, matching the
 event calendar and the `RMS_AS_OF_DATE` variable. File names deliberately keep
@@ -424,8 +490,8 @@ with a regex that matches that suffix.
 ### Report retention
 
 After the two reports are written, the engine keeps only the newest 3 distinct
-report dates in the folder and MOVES older ones - including their `_HHMMSS`
-fallback copies - into an `archive/` subfolder. This is a soft delete: nothing
+report dates in the folder and MOVES older ones - including their `_FALLBACK`
+copies and any legacy `_HHMMSS` copies - into an `archive/` subfolder. This is a soft delete: nothing
 is deleted, so drag a file back out of `archive/` to restore it. The decision
 uses the ISO date parsed from the file name in the selected property timezone,
 not the file modification time or calendar days; a report date in the future
@@ -447,7 +513,7 @@ result.
 | `ModuleNotFoundError` | Run `pip install pandas numpy requests schedule`; add `tzdata` on Windows if you use named timezones. The UI also reports missing packages in its log box. |
 | `[ERROR] Event calendar not found` | Confirm `Public holidays.csv` exists beside the scripts. If it is missing, restore it from version control or recreate it with the header shown in **Columns**; the engine will not produce rates from an incomplete calendar. |
 | An error names a calendar line number | Fix that row in `Public holidays.csv` and run again. Bare `MM-DD` dates and non-positive or non-numeric factors are rejected. |
-| Reports are not where you expected | They are written to the current working directory. `cd` to the repository first, or use the `.bat` launchers. |
+| Reports are not where you expected | They are written to the script folder. Check the `[OK] ... written: <path>` line in the log for the exact location. |
 | No automatic 06:00 run | A scheduler process must be running (`python scheduler.py --run-now`). It stays resident; close its window or press `Ctrl+C` to stop it. |
 | `Timezone data not available` in the UI | Run `pip install tzdata`, then reopen the UI; or keep `Follow local system time`. |
 | Excel shows dates differently | See the **Excel note** above and format the `Date` column as Text. |

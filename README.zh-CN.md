@@ -95,7 +95,7 @@ pip install pandas numpy requests schedule
 
 ## 快速开始
 
-先 `cd` 到仓库目录，`.bat` 启动器会自动切换。报告写入**当前工作目录**。
+先 `cd` 到仓库目录，`.bat` 启动器会自动切换。报告始终写入**脚本所在文件夹**，无论从哪个目录启动引擎。
 
 ```bat
 python "hotel rms.py"          # 运行一次，生成两份 CSV
@@ -117,7 +117,7 @@ python scheduler.py --run-now  # 先跑一次，然后常驻等待每日 06:00
 | --- | --- | --- |
 | `Date` | `YYYY/MM/DD`，如 `2026/12/25` | 必须带四位年份。`Recurring=Y` 时只取月日，年份为占位符；否则只定价该日期一次 |
 | `Event_Name` | 文本，可空 | 显示在报告中；为空时原因显示 `Public Holiday Demand Window Triggered` |
-| `Event_Factor` | > 0 的数值 | 需求乘数：`1.00` 不变，`1.25` 为 +25%，`0.90` 为 -10%。常用区间 0.50–3.00，越界仍会载入但输出 `[WARN]` |
+| `Event_Factor` | 有限数值且 > 0 | 需求乘数：`1.00` 不变，`1.25` 为 +25%，`0.90` 为 -10%。留空、`NaN` 或 `inf` 会中止运行，绝不当作「无事件」处理。常用区间 0.50–3.00，越界仍会载入并输出 `[WARN]`；超过 5.00 会额外标记为疑似录入错误 |
 | `Category` | `Public Holiday` / `Special Event` / `School Holiday` / `Custom` | 用于定价原因；未知值映射为 `Special Event` 并告警 |
 | `Recurring` | `Y` 或 `N`（空 = `N`） | `Y` 每年重复同一月日 |
 
@@ -129,8 +129,11 @@ python scheduler.py --run-now  # 先跑一次，然后常驻等待每日 06:00
 - `Recurring=Y` 只取月日，固定日期节假日自动延续到后续年份。
 - 同一日期上，一次性行（`Recurring=N`）覆盖年度行，**不论先后顺序**；同类型行之间，文件中最后一行胜。用一次性行可覆盖某一年的节假日。
 - 只定价当前 90 天窗口内的日期。窗口从所选物业时区的当日开始，跨日期线切换时区可能让窗口平移一天，属预期行为。
-- 文件缺失、缺 `Date` / `Event_Factor` 列、日期非法、因子非数值或 ≤ 0：中止运行并给出行号，不静默回退到演示事件。
-- 窗口覆盖的某年完全没有事件行时输出警告；展开到该年的年度行也算在内，因此只有年度节假日的日历不会每年告警。
+- 文件缺失、缺 `Date` / `Event_Factor` 列、日期非法、因子非数值 / 非有限 / ≤ 0：中止运行并给出行号，不静默回退到演示事件。
+- 日历维护分两级检查，并且每次运行都会报出覆盖率，例如 `Calendar coverage: 5 of 90 stay dates carry an event factor (5.6%)`：
+  - 某年完全没有事件行：告警提示该年度尚未维护。
+  - 某年**只有**年度行（Recurring=Y）：告警提示该年没有任何一次性事件，移动节日（春节、复活节、赛事）会被当作普通日定价。年度占位行不再算作覆盖，这正是漏维护移动节日过去完全静默的原因。
+- 同一日期被载入两次且因子不同时，仍然最后一行胜，但会输出告警并同时点出两行行号，避免无意的覆盖被当成正确价格。
 - 只有日历错误会中止运行；PMS 时间戳或时区设置异常只输出 `[WARN]` 并回退默认值。
 
 ### 随附示例
@@ -153,10 +156,14 @@ Final_ADR         = round(clip(Recommended_ADR, MIN_ADR, MAX_ADR), 0)
 
 ```text
 MIN_ADR = Base_Room_ADR x 0.70
-MAX_ADR = Base_Room_ADR x max(2.00, Event_Factor x 1.60)
+MAX_ADR = Base_Room_ADR x min(max(2.00, Event_Factor x 1.60), 4.00)
 ```
 
 上限为事件日留出余量。以当前最大因子 `1.50` 计算，上限是 `2.40 x Base_Room_ADR`，而不是 `2.00 x`。被截断的行在技术视图标记 `Rate_Cap_Applied`，在管理视图追加 `| Rate ceiling applied` / `| Rate floor applied`。
+
+最外层的 `4.00` 是绝对上限。事件余量在 `Event_Factor` 不超过 `2.50` 时完全生效；超过后上限不再增长，因此误填 `15.00` 不会再让 `135` 的基准价变成 `2924` 的夜间报价。绝对上限生效时，运行会输出 `[WARN]`，点出入住日期、因子以及原本会放开的余量。
+
+发布之前 `price_guard.find_violations()` 会复核定价结果：所有价格列为有限值、`Final_ADR` 落在 `MIN_ADR`/`MAX_ADR` 之内（为最终取整留半个货币单位的容差）、`MAX_ADR` 大于 `MIN_ADR`、且同一入住日期与房型不重复。任一项不通过即以退出码 `3` 中止，并向日志写入 `[ERROR]`，不发布与自身护栏矛盾的价格。
 
 ## 可复现性
 
@@ -193,6 +200,8 @@ PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：
 
 `hotel rms.py` 中的 `deterministic_competitor_adr()` 与 `BASELINE_ADR` 是两处替换点：分别接入真实竞品抓取与历史 ADR。未替换前，即使接了实时 PMS，建议价仍含合成成分，因此模式名是 `LIVE_PMS_SYNTHETIC_MARKET` 而不是 `LIVE`。
 
+配置了凭据不等于拿到了实时数据。两次 PMS 取数都会记录实际使用的来源，`Data_Mode` 在**两者都完成后**才判定：任一请求失败即标为 `PMS_FALLBACK_SYNTHETIC_MARKET`，界面横幅变红，`rms_run.log` 写入 `[WARN]`。因此报告不可能声称用了并未拿到的 LIVE 数据。`Data_Sources` 逐项记录 `demo_synthetic` / `synthetic_fallback` / `PMS_live`。
+
 ## PMS 接口
 
 请求格式参照 Cloudbeds API v1.3，**仅作格式参考**：本仓库不隶属任何厂商，不含真实端点、凭据或可用集成。
@@ -224,25 +233,33 @@ PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：
 同一设置同时决定：
 
 - 每日 06:00 的无人值守运行。必须有常驻的 `scheduler.py` 进程（见快速开始）；运行中的调度器约一分钟内感知配置变化并重建任务。
-- 引擎的「今天」：90 天窗口、星期因子、距入住天数、报告日期后缀、带时间戳的备用文件名。
+- 引擎的「今天」：90 天窗口、星期因子、距入住天数、报告日期后缀。
 - PMS `property_now` 的小时数，驱动当日折扣档位（18:00 / 20:00 / 22:00）。`DEMO` 模式下该小时取所选时区的当前墙上时间。
 
 跨日期线切换可能让窗口平移一天，从而改变落在窗口内的日历行，属预期行为。
 
 ## 输出文件
 
-每次运行在**当前工作目录**生成两份报告（启动器会把目录切到脚本所在文件夹）：
+每次运行都在**脚本所在文件夹**生成两份报告，无论从哪个目录启动引擎：
 
-- `hotel_name_Live_Dashboard_YYYY-MM-DD.csv`：技术视图，20 列 —— `Stay_Date`、`Room_Type`、`Day_of_Week`、`Event_Name`、`Event_Category`、`Event_Factor`、`Event_Source`、`Days_to_Checkin`、`Current_Occupancy`、`Pace_Ratio`、`Base_Room_ADR`、`Competitor_ADR`、`Recommended_ADR`、`MIN_ADR`、`MAX_ADR`、`Rate_Cap_Applied`、`Final_ADR`、`Expected_RevPAR`、`Confidence_Score`、`Data_Mode`。`Recommended_ADR` 是护栏处理前的值。
-- `hotel_name_RMS_Manager_View_YYYY-MM-DD.csv`：管理视图，10 列 —— `Stay_Date`、`Room_Type`、`Current_Occupancy`、`Final_ADR`、`ADR_Change_vs_Base`、`Demand_Status`、`Action`、`Confidence_Score`、`Reason`、`Data_Mode`。
+- `hotel_name_Live_Dashboard_YYYY-MM-DD.csv`：技术视图，34 列 —— 原有 20 列（`Stay_Date`、`Room_Type`、`Day_of_Week`、`Event_Name`、`Event_Category`、`Event_Factor`、`Event_Source`、`Days_to_Checkin`、`Current_Occupancy`、`Pace_Ratio`、`Base_Room_ADR`、`Competitor_ADR`、`Recommended_ADR`、`MIN_ADR`、`MAX_ADR`、`Rate_Cap_Applied`、`Final_ADR`、`Expected_RevPAR`、`Confidence_Score`、`Data_Mode`）加 12 列审计列（`RoomType_Factor`、`Weekend_Factor`、`Effective_Occupancy`、`Current_OTB_Rooms`、`Hist_OTB_At_Same_LeadTime`、`Occupancy_Factor`、`Lead_Time_Factor`、`Booking_Pace_Factor`、`Competitor_Ratio`、`Competitor_Factor`、`Model_ADR_Before_Adjustments`、`Post_Model_Adjustment_Factor`）、1 列来源列 `Data_Sources` 与 `Run_Timestamp`。`Recommended_ADR` 是护栏处理前的值，可由 `Base_Room_ADR` 连乘 `Weekend_Factor`、`Event_Factor`、`Occupancy_Factor`、`Lead_Time_Factor`、`Booking_Pace_Factor`、`Competitor_Factor` 与 `Post_Model_Adjustment_Factor` 复算；`Model_ADR_Before_Adjustments` 是同日调整前的连乘结果。
+- `hotel_name_RMS_Manager_View_YYYY-MM-DD.csv`：管理视图，12 列 —— `Stay_Date`、`Room_Type`、`Current_Occupancy`、`Final_ADR`、`ADR_Change_vs_Base`、`Demand_Status`、`Action`、`Confidence_Score`、`Reason`、`Data_Mode`、`Data_Sources`、`Run_Timestamp`。显示百分比与 `Action` 用同一个已舍入的数值判定，不会出现「显示 +25.0% 却判 Raise Rate」。
 
-两者都被 git 忽略。若文件在 Excel 中打开而无法覆盖，引擎改存 `..._YYYY-MM-DD_HHMMSS.csv` 并输出含该文件名的 `[WARN]`。
+`Data_Sources` 明确标注各输入来源：`baseline=constant_synthetic`、`competitor=synthetic_hash`，`dashboard=` / `reservations=` 取 `demo_synthetic`、`synthetic_fallback` 或 `PMS_live`。
+
+`Run_Timestamp` 每次运行只有一个值，两份报告写得完全一致，因此可以据此确认两份文件出自同一次运行；界面会比对这两个值，不一致时提示重新运行。
+
+两者都被 git 忽略。报告采用原子发布：先写入私有临时文件，再用一次 `os.replace` 就位；读取方永远不会看到写了一半的文件，同一天多次运行（含并发）也不会交错写入。若文件在 Excel 中打开而无法覆盖，引擎改存固定的 `..._YYYY-MM-DD_FALLBACK.csv` 并输出含该文件名的 `[WARN]`；后续运行复用同一个备用名，目录不会堆积带时间戳的副本。
+
+每次运行还会把 `[INFO]` / `[WARN]` / `[OK]` 追加到脚本文件夹的 `rms_run.log`。该文件只增不删、已被 git 忽略，关掉界面后依然存在，因此 PMS 降级、日历告警、报表发布失败等都能事后审计。
+
+界面在启动引擎前会清除 `RMS_AS_OF_DATE` 与 `RMS_AS_OF_DATETIME`，因此 shell 里残留的回测变量不会让回放报表伪装成当日建议。另外，`Data generated` 显示的是报表文件的实际生成时间，不是点击按钮的时刻。
 
 报告内的 `Stay_Date` 用 `YYYY/MM/DD`，与日历和 `RMS_AS_OF_DATE` 一致；文件名保留 ISO `YYYY-MM-DD`，因为斜杠 `/` 不能出现在 Windows 文件名中（Windows 原生路径分隔符是 `\`）。界面用匹配该后缀的正则定位报告。
 
 ### 报告保留策略
 
-两份报告写入后，引擎只在脚本文件夹保留最近 **3 个不同报告日期**，更早的报告（连同其 `_HHMMSS` 备用副本）会被**移动**到 `archive/` 子目录。这是软删除，不删除任何文件；需要恢复时把文件从 `archive/` 拖回即可。判断依据是文件名里的 ISO 日期（按所选物业时区解析），不是文件修改时间，也不是日历天数；未来日期或无法解析的文件名会原样保留并输出 `[WARN]`。
+两份报告写入后，引擎只在脚本文件夹保留最近 **3 个不同报告日期**，更早的报告（连同其 `_FALLBACK` 备用副本及旧版 `_HHMMSS` 副本）会被**移动**到 `archive/` 子目录。这是软删除，不删除任何文件；需要恢复时把文件从 `archive/` 拖回即可。判断依据是文件名里的 ISO 日期（按所选物业时区解析），不是文件修改时间，也不是日历天数；未来日期或无法解析的文件名会原样保留并输出 `[WARN]`。
 
 可用 `RMS_REPORT_KEEP` 调整份数（默认 `3`）；设置 `RMS_REPORT_RETENTION_DRY_RUN=1` 可只预览待移动清单而不改动文件。使用 `RMS_AS_OF_DATE` 或 `RMS_AS_OF_DATETIME` 的回测运行会整体跳过归档，回放报告不会被移走。归档失败只输出 `[WARN]`，不会让定价周期失败。界面只扫描脚本文件夹，因此归档报告不会被当成最新结果。
 
@@ -254,7 +271,7 @@ PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：
 | `ModuleNotFoundError` | `pip install pandas numpy requests schedule`；使用命名时区时在 Windows 另装 `tzdata` |
 | `[ERROR] Event calendar not found` | 确认 `Public holidays.csv` 在脚本目录；缺失时从版本控制恢复，或按「列」一节重建表头。引擎不会基于不完整日历出价 |
 | 报错带日历行号 | 修正该行后重跑；裸 `MM-DD`、非数值因子、因子 ≤ 0 都会被拒绝 |
-| 报告不在预期位置 | 报告写入当前工作目录；先 `cd` 到仓库目录，或用 `.bat` |
+| 报告不在预期位置 | 报告写入脚本所在文件夹；看日志里的 `[OK] ... written: <路径>` 行确认具体位置 |
 | 前几天的报告不见了 | 已移入 `archive/` 子目录，并未删除；拖回脚本文件夹即可恢复。见「报告保留策略」 |
 | 没有每日 06:00 自动运行 | 需启动常驻 `scheduler.py`（`python scheduler.py --run-now`）；关闭窗口或 `Ctrl+C` 即停止 |
 | 界面提示 `Timezone data not available` | `pip install tzdata` 后重开界面；或保留 `Follow local system time` |

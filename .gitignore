@@ -17,6 +17,9 @@ __pycache__/
 timezone_settings.json
 timezone_settings.json.tmp
 
+# Local regression baseline and its read-only diff tool
+golden/
+
 # Agent / assistant working data and chat logs - never commit
 # (also enforced machine-wide via the global core.excludesfile)
 .workbuddy/

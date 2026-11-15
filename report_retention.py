@@ -10,7 +10,7 @@ Design constraints:
   * Group files by the ISO date parsed from the FILE NAME. Never use mtime,
     never count files, never use calendar days. One daily report is one date:
     the Live_Dashboard plus the RMS_Manager_View, together with any
-    _HHMMSS fallback files written while Excel holds a file open.
+    fixed _FALLBACK copies written while Excel holds a file open.
   * Strict whitelist regex only; no glob and no broad "*.csv" patterns.
   * Expected filesystem errors (PermissionError / WinError 32) are skipped
     with a WARN; the source file is left in place and the pricing cycle is
@@ -47,7 +47,7 @@ TRUE_VALUES = frozenset(("1", "true", "yes", "on"))
 # direction (never archive a file we cannot prove we created).
 REPORT_RE = re.compile(
     r"^hotel_name_(Live_Dashboard|RMS_Manager_View)"
-    r"_(\d{4}-\d{2}-\d{2})(_\d{6})?\.csv$"
+    r"_(\d{4}-\d{2}-\d{2})(_\d{6}|_FALLBACK)?\.csv$"
 )
 
 # Indirection so verification can simulate a locked file by patching this

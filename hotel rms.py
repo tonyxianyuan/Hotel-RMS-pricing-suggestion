@@ -41,7 +41,13 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
-from event_calendar import CalendarError, load_event_calendar  # noqa: E402
+from event_calendar import (  # noqa: E402
+    CalendarError,
+    describe_coverage,
+    load_event_calendar,
+)
+from price_guard import find_violations  # noqa: E402
+from report_writer import publish_report  # noqa: E402
 from timezone_config import (  # noqa: E402
     format_utc_offset,
     load_timezone,
@@ -67,13 +73,32 @@ BASE_URL = os.environ.get("PMS_BASE_URL", "https://api.example-pms.com/api/v1.3"
 HEADERS = {"accept": "application/json", "x-api-key": API_KEY}
 
 PMS_IS_LIVE = bool(API_KEY) and not API_KEY.startswith("YOUR_") and "example-pms.com" not in BASE_URL
-# Even with a live PMS, the competitor feed and baseline ADR below are still
-# synthetic. The label makes that limitation explicit in every report.
-DATA_MODE = "LIVE_PMS_SYNTHETIC_MARKET" if PMS_IS_LIVE else "DEMO"
-DATA_MODE_LABEL = {
+# Provenance is filled in by the two PMS adapters and resolved only AFTER both
+# reads finish. A configured key alone must never make a report claim LIVE.
+DATA_QUALITY = {"dashboard": "pending", "reservations": "pending"}
+MODE_LABELS = {
     "DEMO": "synthetic PMS reservations, synthetic competitor rates, constant baseline ADR",
     "LIVE_PMS_SYNTHETIC_MARKET": "live PMS reservations, synthetic competitor rates, constant baseline ADR",
-}[DATA_MODE]
+    "PMS_FALLBACK_SYNTHETIC_MARKET": "PMS unavailable, synthetic reservations substituted, synthetic competitor rates, constant baseline ADR",
+}
+
+
+def resolve_data_mode(quality):
+    """Return (mode, label, sources) from what the adapters ACTUALLY used."""
+    if not PMS_IS_LIVE:
+        mode = "DEMO"
+    elif "synthetic_fallback" in quality.values() or "pending" in quality.values():
+        # Anything short of two confirmed live reads is NOT live data.
+        mode = "PMS_FALLBACK_SYNTHETIC_MARKET"
+    else:
+        mode = "LIVE_PMS_SYNTHETIC_MARKET"
+    # Baseline ADR and competitor rates are always synthetic in this build.
+    # Say so explicitly instead of letting the column names imply real data.
+    sources = (
+        "baseline=constant_synthetic; competitor=synthetic_hash; "
+        "dashboard={}; reservations={}"
+    ).format(quality["dashboard"], quality["reservations"])
+    return mode, MODE_LABELS[mode], sources
 
 PRICING_WINDOW_DAYS = 90
 BASELINE_ADR = {"Standard": 135.0, "Premium": 160.0}
@@ -92,6 +117,13 @@ COMPETITOR_MAX_ADR = 175.0
 MIN_RATE_MULTIPLIER = 0.70
 MAX_RATE_MULTIPLIER = 2.00
 EVENT_CAP_HEADROOM = 1.60
+
+# Absolute ceiling, applied ON TOP of the event headroom. The headroom exists
+# so a real event can lift the cap, but it must not be unbounded: a mistyped
+# Event_Factor (15.00 instead of 1.50) used to raise the cap to 24x the base
+# rate. Headroom therefore stays fully effective up to an Event_Factor of
+# 2.50 and is hard-capped at 4.00x beyond that.
+ABSOLUTE_MAX_RATE_MULTIPLIER = 4.00
 
 # Every "today / now" value in this run comes from one aware timestamp in the
 # selected property timezone. The staff UI writes the choice; this process
@@ -126,16 +158,45 @@ WINDOW_START = TODAY
 WINDOW_END = TODAY + pd.Timedelta(days=PRICING_WINDOW_DAYS - 1)
 
 
+RUN_LOG_FILE = os.path.join(APP_DIR, "rms_run.log")
+
+
+def _append_run_log(line):
+    """Persist one log line for post-mortem auditing. Never raises.
+
+    A short append per line is deliberate: several pricing cycles may run on
+    the same day, and separate processes must not hold a shared file handle.
+    """
+    try:
+        stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        with open(RUN_LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write("{} {}\n".format(stamp, line))
+    except OSError:
+        pass
+
+
 def log_info(message):
-    print("[INFO] {}".format(message))
+    line = "[INFO] {}".format(message)
+    print(line)
+    _append_run_log(line)
 
 
 def log_warn(message):
-    print("[WARN] {}".format(message))
+    line = "[WARN] {}".format(message)
+    print(line)
+    _append_run_log(line)
 
 
 def log_ok(message):
-    print("[OK] {}".format(message))
+    line = "[OK] {}".format(message)
+    print(line)
+    _append_run_log(line)
+
+
+def log_error(message):
+    line = "[ERROR] {}".format(message)
+    print(line)
+    _append_run_log(line)
 
 
 # ==========================================
@@ -158,7 +219,11 @@ def fetch_dashboard_data():
         if not data:
             raise ValueError("Empty dashboard payload")
         log_info("Dashboard payload received from the PMS.")
+        DATA_QUALITY["dashboard"] = "PMS_live"
     except Exception as exc:
+        DATA_QUALITY["dashboard"] = (
+            "synthetic_fallback" if PMS_IS_LIVE else "demo_synthetic"
+        )
         log_warn("Dashboard unavailable ({}). Using synthetic demo metrics.".format(exc))
         data = {
             "property_now": NOW.strftime("%Y-%m-%d %H:%M:%S"),
@@ -214,7 +279,11 @@ def fetch_and_build_pace():
             )
         json_data = response.json()
         log_info("Reservation payload received from the PMS.")
+        DATA_QUALITY["reservations"] = "PMS_live"
     except Exception as exc:
+        DATA_QUALITY["reservations"] = (
+            "synthetic_fallback" if PMS_IS_LIVE else "demo_synthetic"
+        )
         log_warn(
             "Reservations unavailable ({}). Using synthetic demo reservations.".format(exc)
         )
@@ -337,9 +406,20 @@ log_info("Pricing window: {} .. {} ({} days)".format(
     WINDOW_START.strftime("%Y/%m/%d"),
     WINDOW_END.strftime("%Y/%m/%d"),
     PRICING_WINDOW_DAYS))
-log_info("Data mode: {} ({})".format(DATA_MODE, DATA_MODE_LABEL))
+log_info("PMS credentials: {}".format(
+    "configured" if PMS_IS_LIVE else "not configured (DEMO)"))
 
 df_pace = fetch_and_build_pace()
+
+# Both adapters have now reported what they actually used; resolve the mode
+# once, here, before anything is written to a report.
+DATA_MODE, DATA_MODE_LABEL, DATA_SOURCES = resolve_data_mode(DATA_QUALITY)
+log_info("Effective data mode: {} ({})".format(DATA_MODE, DATA_MODE_LABEL))
+if DATA_MODE == "PMS_FALLBACK_SYNTHETIC_MARKET":
+    log_warn(
+        "PMS fallback: the PMS was configured but unavailable, so this report "
+        "uses synthetic data. Do not treat it as live market data."
+    )
 
 try:
     calendar = load_event_calendar(CALENDAR_FILE, WINDOW_START, WINDOW_END)
@@ -353,6 +433,9 @@ log_info(
         len(calendar.events), os.path.basename(CALENDAR_FILE)
     )
 )
+# State the coverage explicitly: "5 of 90 dates" makes an under-maintained
+# calendar visible, whereas an absolute count of 5 tells nobody anything.
+log_info(describe_coverage(calendar, WINDOW_START, WINDOW_END))
 
 window_dates = pd.date_range(WINDOW_START, periods=PRICING_WINDOW_DAYS)
 df_comp = pd.DataFrame(
@@ -514,6 +597,10 @@ df_model["Recommended_ADR"] = (
     * df_model["Competitor_Factor"]
 )
 
+# Keep the pure multiplicative model price before the same-day adjustments
+# overwrite Recommended_ADR, so the technical view stays reproducible.
+df_model["Model_ADR_Before_Adjustments"] = df_model["Recommended_ADR"].copy()
+
 # Same-day time decay and guest density surcharge.
 prop_hour = PROPERTY_NOW.hour
 guest_density = (IN_HOUSE_GUESTS / IN_HOUSE_ROOMS) if IN_HOUSE_ROOMS > 0 else 0
@@ -537,12 +624,19 @@ def apply_advanced_optimizations(row):
 
 
 df_model["Recommended_ADR"] = df_model.apply(apply_advanced_optimizations, axis=1)
+# Derive the combined post-model adjustment without changing the adjustment
+# function itself, so the multiplicative chain stays verifiable end to end.
+df_model["Post_Model_Adjustment_Factor"] = (
+    df_model["Recommended_ADR"] / df_model["Model_ADR_Before_Adjustments"]
+)
 
 # Rate guards with event headroom. The cap flag is exported so a clipped rate
 # is visible instead of looking like the calendar had no effect.
 df_model["MIN_ADR"] = df_model["Base_Room_ADR"] * MIN_RATE_MULTIPLIER
-df_model["MAX_ADR"] = df_model["Base_Room_ADR"] * np.maximum(
-    MAX_RATE_MULTIPLIER, df_model["Event_Factor"] * EVENT_CAP_HEADROOM
+event_headroom = df_model["Event_Factor"] * EVENT_CAP_HEADROOM
+df_model["MAX_ADR"] = df_model["Base_Room_ADR"] * np.minimum(
+    np.maximum(MAX_RATE_MULTIPLIER, event_headroom),
+    ABSOLUTE_MAX_RATE_MULTIPLIER,
 )
 df_model["Rate_Cap_Applied"] = (
     (df_model["Recommended_ADR"] > df_model["MAX_ADR"])
@@ -554,6 +648,35 @@ df_model["Final_ADR"] = np.clip(
 df_model["Expected_RevPAR"] = (
     df_model["Final_ADR"] * (df_model["Current_Occupancy"] / 100)
 ).round(2)
+
+# The absolute ceiling must announce itself. A capped event night is a data
+# question for the staff, not something to discover later in a report.
+absolute_bound = event_headroom > ABSOLUTE_MAX_RATE_MULTIPLIER
+if absolute_bound.any():
+    worst_index = df_model.loc[absolute_bound, "Event_Factor"].idxmax()
+    worst = df_model.loc[worst_index]
+    log_warn(
+        "Absolute rate ceiling Base x {:.2f} applied to {} row(s) because an "
+        "event factor is unusually high (worst: {} {}, Event_Factor {:.2f}, "
+        "event headroom would have allowed Base x {:.2f}). Check "
+        "'Public holidays.csv' for a data-entry error.".format(
+            ABSOLUTE_MAX_RATE_MULTIPLIER,
+            int(absolute_bound.sum()),
+            worst["Stay_Date"].strftime("%Y/%m/%d"),
+            worst["Room_Type"],
+            float(worst["Event_Factor"]),
+            float(event_headroom.loc[worst_index]),
+        )
+    )
+
+# Refuse to publish a rate that breaks its own guard. A broken frame is a bug
+# upstream, so the run stops instead of handing a manager a number that
+# contradicts its own floor, ceiling or provenance.
+guard_problems = find_violations(df_model)
+if guard_problems:
+    for problem in guard_problems:
+        log_error("Guard check failed: {}".format(problem))
+    raise SystemExit(3)
 
 
 def calculate_confidence(row):
@@ -602,24 +725,40 @@ output_cols = [
     "Final_ADR",
     "Expected_RevPAR",
     "Confidence_Score",
+    "RoomType_Factor",
+    "Weekend_Factor",
+    "Effective_Occupancy",
+    "Current_OTB_Rooms",
+    "Hist_OTB_At_Same_LeadTime",
+    "Occupancy_Factor",
+    "Lead_Time_Factor",
+    "Booking_Pace_Factor",
+    "Competitor_Ratio",
+    "Competitor_Factor",
+    "Model_ADR_Before_Adjustments",
+    "Post_Model_Adjustment_Factor",
 ]
 df_dashboard = df_model[output_cols].copy()
 # Human-readable dates use YYYY/MM/DD everywhere; the file name suffix below
 # stays ISO because "/" cannot appear in a Windows file name.
 df_dashboard["Stay_Date"] = df_dashboard["Stay_Date"].dt.strftime("%Y/%m/%d")
 df_dashboard["Data_Mode"] = DATA_MODE
+df_dashboard["Data_Sources"] = DATA_SOURCES
 
 date_suffix = AS_OF_DATE.strftime("%Y-%m-%d")
-tech_filename = "hotel_name_Live_Dashboard_{}.csv".format(date_suffix)
-try:
-    df_dashboard.to_csv(tech_filename, index=False)
-    log_ok("Technical view written: {}".format(tech_filename))
-except PermissionError:
-    alternative_name = "hotel_name_Live_Dashboard_{}_{}.csv".format(
-        date_suffix, NOW.strftime("%H%M%S")
-    )
-    df_dashboard.to_csv(alternative_name, index=False)
-    log_warn("Technical view file was open in Excel; saved as {}".format(alternative_name))
+# One timestamp per cycle, written into BOTH reports, so a consumer can prove
+# the pair came from the same run even after several runs on the same day.
+run_timestamp = NOW.strftime("%Y-%m-%dT%H:%M:%S%z")
+df_dashboard["Run_Timestamp"] = run_timestamp
+# Publish by absolute path: the reports belong next to the scripts, not in
+# whichever directory happened to launch the engine.
+tech_filename = os.path.join(
+    APP_DIR, "hotel_name_Live_Dashboard_{}.csv".format(date_suffix))
+tech_name, tech_status, tech_message = publish_report(df_dashboard, tech_filename)
+if tech_status == "ok":
+    log_ok("Technical view written: {}".format(tech_name))
+else:
+    log_warn("Technical view {}: {}".format(tech_status, tech_message))
 
 
 # ==========================================
@@ -630,7 +769,11 @@ log_info("Compiling the manager view...")
 raw_pct_change = (
     (df_model["Final_ADR"] - df_model["Base_Room_ADR"]) / df_model["Base_Room_ADR"]
 ) * 100
-df_model["ADR_Change_vs_Base"] = raw_pct_change.apply(
+# Display and action must be driven by the SAME rounded value. Using the raw
+# percentage for the action can otherwise show "+25.0%" while the row says
+# "Raise Rate" because the unrounded value was 24.96.
+shown_pct_change = raw_pct_change.round(1)
+df_model["ADR_Change_vs_Base"] = shown_pct_change.apply(
     lambda value: "+{:.1f}%".format(value) if value > 0 else "{:.1f}%".format(value)
 )
 
@@ -666,7 +809,7 @@ def assign_manager_action(pct_val):
     return "Discount"
 
 
-df_model["Action"] = raw_pct_change.apply(assign_manager_action)
+df_model["Action"] = shown_pct_change.apply(assign_manager_action)
 
 
 def extract_business_reason(row):
@@ -734,17 +877,16 @@ df_manager_view.sort_values(
 )
 df_manager_view["Stay_Date"] = df_manager_view["Stay_Date"].dt.strftime("%Y/%m/%d")
 df_manager_view["Data_Mode"] = DATA_MODE
+df_manager_view["Data_Sources"] = DATA_SOURCES
 
-manager_filename = "hotel_name_RMS_Manager_View_{}.csv".format(date_suffix)
-try:
-    df_manager_view.to_csv(manager_filename, index=False)
-    log_ok("Manager view written: {}".format(manager_filename))
-except PermissionError:
-    alternative_mgr_name = "hotel_name_RMS_Manager_View_{}_{}.csv".format(
-        date_suffix, NOW.strftime("%H%M%S")
-    )
-    df_manager_view.to_csv(alternative_mgr_name, index=False)
-    log_warn("Manager view file was open in Excel; saved as {}".format(alternative_mgr_name))
+df_manager_view["Run_Timestamp"] = run_timestamp
+manager_filename = os.path.join(
+    APP_DIR, "hotel_name_RMS_Manager_View_{}.csv".format(date_suffix))
+mgr_name, mgr_status, mgr_message = publish_report(df_manager_view, manager_filename)
+if mgr_status == "ok":
+    log_ok("Manager view written: {}".format(mgr_name))
+else:
+    log_warn("Manager view {}: {}".format(mgr_status, mgr_message))
 
 capped_rows = int(df_model["Rate_Cap_Applied"].sum())
 log_info(
@@ -758,9 +900,9 @@ log_info("Pricing cycle complete. Data mode: {}".format(DATA_MODE))
 # ==========================================
 # 7. REPORT RETENTION (soft-delete; exactly one call per process)
 # ==========================================
-# All four launch paths converge on this process. The two to_csv calls above
-# use bare relative names, so their landing directory is os.getcwd(); nothing
-# in this file calls os.chdir(), so the retention scan MUST use the same dir.
+# All four launch paths converge on this process. Both reports are published
+# into APP_DIR by absolute path, so the retention scan MUST use APP_DIR too,
+# regardless of the directory this process was started from.
 if AS_OF_OVERRIDE or AS_OF_DATETIME_OVERRIDE:
     # Back-testing / training / year-over-year replay: skip the whole action,
     # so a replay report is never archived and real dailies are never judged
@@ -776,7 +918,7 @@ else:
 
         _emit = {"INFO": log_info, "OK": log_ok, "WARN": log_warn}
         for _level, _message in apply_retention(
-            output_dir=os.getcwd(), today=NOW.date()
+            output_dir=APP_DIR, today=NOW.date()
         ):
             _emit.get(_level, log_info)("[RETENTION] {}".format(_message))
     except Exception as _exc:
