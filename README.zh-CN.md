@@ -18,11 +18,14 @@
 | `rms_gui.py` | Tkinter 界面：运行定价、查看结果、解释房价、打开日历 |
 | `scheduler.py` | 常驻调度进程，每日 06:00 运行（`--run-now` 先跑一次再常驻） |
 | `timezone_config.py` | 共享时区设置与 IANA 可用性检查，库模块 |
+| `report_writer.py` | 原子发布报告：私有临时文件 + 一次 `os.replace`，库模块 |
+| `report_retention.py` | 将旧报告软删除归档到 `archive/`，库模块 |
+| `price_guard.py` | 发布前对定价结果做只读一致性检查，库模块 |
 | `Run_Pricing_Now.bat` | Windows：运行一次定价 |
 | `Start_Pricing_UI.bat` | Windows：打开界面 |
 | `User_Guide.txt` | 操作员速查（英文） |
 
-可运行入口只有 `hotel rms.py`、`rms_gui.py`、`scheduler.py`。`timezone_settings.json` 由界面选择时区时生成，已被 git 忽略；报告、日志、`__pycache__`、本地凭据同样被忽略。
+可运行入口只有 `hotel rms.py`、`rms_gui.py`、`scheduler.py`。`event_calendar.py`、`timezone_config.py`、`report_writer.py`、`report_retention.py`、`price_guard.py` 均由这些脚本导入，没有命令行接口。`timezone_settings.json` 由界面选择时区时生成，已被 git 忽略；报告、日志、`__pycache__`、本地凭据同样被忽略。
 
 ## 系统架构
 
@@ -163,7 +166,7 @@ MAX_ADR = Base_Room_ADR x min(max(2.00, Event_Factor x 1.60), 4.00)
 
 最外层的 `4.00` 是绝对上限。事件余量在 `Event_Factor` 不超过 `2.50` 时完全生效；超过后上限不再增长，因此误填 `15.00` 不会再让 `135` 的基准价变成 `2924` 的夜间报价。绝对上限生效时，运行会输出 `[WARN]`，点出入住日期、因子以及原本会放开的余量。
 
-发布之前 `price_guard.find_violations()` 会复核定价结果：所有价格列为有限值、`Final_ADR` 落在 `MIN_ADR`/`MAX_ADR` 之内（为最终取整留半个货币单位的容差）、`MAX_ADR` 大于 `MIN_ADR`、且同一入住日期与房型不重复。任一项不通过即以退出码 `3` 中止，并向日志写入 `[ERROR]`，不发布与自身护栏矛盾的价格。
+发布之前 `price_guard.find_violations()` 会复核定价结果：七列价格（`MIN_ADR`、`MAX_ADR`、`Recommended_ADR`、`Model_ADR_Before_Adjustments`、`Post_Model_Adjustment_Factor`、`Final_ADR`、`Expected_RevPAR`）均为有限值、`Final_ADR` 落在 `MIN_ADR`/`MAX_ADR` 之内（为最终取整留半个货币单位的容差）、`MAX_ADR` 大于 `MIN_ADR`、`MIN_ADR` 为正、且同一入住日期与房型不重复。任一项不通过即以退出码 `3` 中止，并向日志写入 `[ERROR]`，不发布与自身护栏矛盾的价格。
 
 ## 可复现性
 
@@ -191,12 +194,12 @@ PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：
 
 ## 数据来源
 
-| 输入 | `DEMO` | `LIVE_PMS_SYNTHETIC_MARKET` |
-| --- | --- | --- |
-| 预订 / 入住率 | 合成，锚定运行日 | 实时 PMS v1.3 |
-| 竞品 ADR | 按入住日期确定性生成的合成哈希 | 同左 |
-| 基准 ADR | 常量 `BASELINE_ADR` | 常量 `BASELINE_ADR` |
-| 节假日 / 活动 | `Public holidays.csv`（员工维护） | 同左 |
+| 输入 | `DEMO` | `LIVE_PMS_SYNTHETIC_MARKET` | `PMS_FALLBACK_SYNTHETIC_MARKET` |
+| --- | --- | --- | --- |
+| 预订 / 入住率 | 合成，锚定运行日 | 实时 PMS v1.3 | 合成回退（至少一次 PMS 读取失败或未完成） |
+| 竞品 ADR | 按入住日期确定性生成的合成哈希 | 按入住日期确定性生成的合成哈希 | 按入住日期确定性生成的合成哈希 |
+| 基准 ADR | 常量 `BASELINE_ADR` | 常量 `BASELINE_ADR` | 常量 `BASELINE_ADR` |
+| 节假日 / 活动 | `Public holidays.csv`（员工维护） | `Public holidays.csv`（员工维护） | `Public holidays.csv`（员工维护） |
 
 `hotel rms.py` 中的 `deterministic_competitor_adr()` 与 `BASELINE_ADR` 是两处替换点：分别接入真实竞品抓取与历史 ADR。未替换前，即使接了实时 PMS，建议价仍含合成成分，因此模式名是 `LIVE_PMS_SYNTHETIC_MARKET` 而不是 `LIVE`。
 
@@ -240,22 +243,33 @@ PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：
 
 ## 输出文件
 
-每次运行都在**脚本所在文件夹**生成两份报告，无论从哪个目录启动引擎：
+每次运行都在**脚本所在文件夹**写出两份 CSV，与启动目录无关：
 
-- `hotel_name_Live_Dashboard_YYYY-MM-DD.csv`：技术视图，34 列 —— 原有 20 列（`Stay_Date`、`Room_Type`、`Day_of_Week`、`Event_Name`、`Event_Category`、`Event_Factor`、`Event_Source`、`Days_to_Checkin`、`Current_Occupancy`、`Pace_Ratio`、`Base_Room_ADR`、`Competitor_ADR`、`Recommended_ADR`、`MIN_ADR`、`MAX_ADR`、`Rate_Cap_Applied`、`Final_ADR`、`Expected_RevPAR`、`Confidence_Score`、`Data_Mode`）加 12 列审计列（`RoomType_Factor`、`Weekend_Factor`、`Effective_Occupancy`、`Current_OTB_Rooms`、`Hist_OTB_At_Same_LeadTime`、`Occupancy_Factor`、`Lead_Time_Factor`、`Booking_Pace_Factor`、`Competitor_Ratio`、`Competitor_Factor`、`Model_ADR_Before_Adjustments`、`Post_Model_Adjustment_Factor`）、1 列来源列 `Data_Sources` 与 `Run_Timestamp`。`Recommended_ADR` 是护栏处理前的值，可由 `Base_Room_ADR` 连乘 `Weekend_Factor`、`Event_Factor`、`Occupancy_Factor`、`Lead_Time_Factor`、`Booking_Pace_Factor`、`Competitor_Factor` 与 `Post_Model_Adjustment_Factor` 复算；`Model_ADR_Before_Adjustments` 是同日调整前的连乘结果。
-- `hotel_name_RMS_Manager_View_YYYY-MM-DD.csv`：管理视图，12 列 —— `Stay_Date`、`Room_Type`、`Current_Occupancy`、`Final_ADR`、`ADR_Change_vs_Base`、`Demand_Status`、`Action`、`Confidence_Score`、`Reason`、`Data_Mode`、`Data_Sources`、`Run_Timestamp`。显示百分比与 `Action` 用同一个已舍入的数值判定，不会出现「显示 +25.0% 却判 Raise Rate」。
+| 报告 | 视图 | 需要了解的列 |
+| --- | --- | --- |
+| `hotel_name_Live_Dashboard_YYYY-MM-DD.csv` | 技术视图，34 列 | 逐日因子、护栏标记、`Recommended_ADR`、`Data_Mode`、`Data_Sources`、`Run_Timestamp` |
+| `hotel_name_RMS_Manager_View_YYYY-MM-DD.csv` | 管理视图，12 列 | `Stay_Date`、`Room_Type`、`Final_ADR`、`ADR_Change_vs_Base`、`Demand_Status`、`Action`、`Reason`、`Confidence_Score`、`Data_Mode`、`Data_Sources`、`Run_Timestamp` |
 
-`Data_Sources` 明确标注各输入来源：`baseline=constant_synthetic`、`competitor=synthetic_hash`，`dashboard=` / `reservations=` 取 `demo_synthetic`、`synthetic_fallback` 或 `PMS_live`。
+`ADR_Change_vs_Base` 的显示值与 `Action` 的判定使用同一个已舍入的百分比。
 
-`Run_Timestamp` 每次运行只有一个值，两份报告写得完全一致，因此可以据此确认两份文件出自同一次运行；界面会比对这两个值，不一致时提示重新运行。
+### 读懂技术视图
 
-两者都被 git 忽略。报告采用原子发布：先写入私有临时文件，再用一次 `os.replace` 就位；读取方永远不会看到写了一半的文件，同一天多次运行（含并发）也不会交错写入。若文件在 Excel 中打开而无法覆盖，引擎改存固定的 `..._YYYY-MM-DD_FALLBACK.csv` 并输出含该文件名的 `[WARN]`；后续运行复用同一个备用名，目录不会堆积带时间戳的副本。
+`Recommended_ADR` 是护栏处理前的值，可由 `Base_Room_ADR` 连乘
+`Weekend_Factor`、`Event_Factor`、`Occupancy_Factor`、`Lead_Time_Factor`、
+`Booking_Pace_Factor`、`Competitor_Factor` 与 `Post_Model_Adjustment_Factor`
+复算；`Model_ADR_Before_Adjustments` 是同日调整前的该乘积。12 个因子列让每一步都可核对。
 
-每次运行还会把 `[INFO]` / `[WARN]` / `[OK]` 追加到脚本文件夹的 `rms_run.log`。该文件只增不删、已被 git 忽略，关掉界面后依然存在，因此 PMS 降级、日历告警、报表发布失败等都能事后审计。
+`Data_Sources` 记录实际使用的输入：`baseline=constant_synthetic`、
+`competitor=synthetic_hash`，`dashboard=` / `reservations=` 取
+`demo_synthetic`、`synthetic_fallback` 或 `PMS_live`。`Run_Timestamp`
+在两份报告中完全一致，可据此确认出自同一次运行；界面发现两者不一致时会告警。
 
-界面在启动引擎前会清除 `RMS_AS_OF_DATE` 与 `RMS_AS_OF_DATETIME`，因此 shell 里残留的回测变量不会让回放报表伪装成当日建议。另外，`Data generated` 显示的是报表文件的实际生成时间，不是点击按钮的时刻。
+### 文件名与安全
 
-报告内的 `Stay_Date` 用 `YYYY/MM/DD`，与日历和 `RMS_AS_OF_DATE` 一致；文件名保留 ISO `YYYY-MM-DD`，因为斜杠 `/` 不能出现在 Windows 文件名中（Windows 原生路径分隔符是 `\`）。界面用匹配该后缀的正则定位报告。
+- 报告内的 `Stay_Date` 用 `YYYY/MM/DD`，文件名保留 ISO `YYYY-MM-DD`，因为 Windows 文件名不允许 `/`。界面按该后缀定位报告。
+- 报告原子写入，不会读到半成品。若文件在 Excel 中打开而无法覆盖，引擎改存 `..._YYYY-MM-DD_FALLBACK.csv` 并输出 `[WARN]`，后续运行复用该名称。
+- 每次运行的告警与错误追加到同目录的 `rms_run.log`。
+- 界面启动引擎前会移除 `RMS_AS_OF_DATE` 与 `RMS_AS_OF_DATETIME`，避免遗留的回测设置被当成当日建议。
 
 ### 报告保留策略
 
@@ -270,7 +284,7 @@ PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：
 | 找不到 `python` | 安装 Python 3.9+ 并加入 `PATH`，或改用 `.bat`（会回退到 `py`） |
 | `ModuleNotFoundError` | `pip install pandas numpy requests schedule`；使用命名时区时在 Windows 另装 `tzdata` |
 | `[ERROR] Event calendar not found` | 确认 `Public holidays.csv` 在脚本目录；缺失时从版本控制恢复，或按「列」一节重建表头。引擎不会基于不完整日历出价 |
-| 报错带日历行号 | 修正该行后重跑；裸 `MM-DD`、非数值因子、因子 ≤ 0 都会被拒绝 |
+| 报错带日历行号 | 修正该行后重跑；裸 `MM-DD`、非数值、非有限（`NaN` / `inf`）及 ≤ 0 的因子都会被拒绝 |
 | 报告不在预期位置 | 报告写入脚本所在文件夹；看日志里的 `[OK] ... written: <路径>` 行确认具体位置 |
 | 前几天的报告不见了 | 已移入 `archive/` 子目录，并未删除；拖回脚本文件夹即可恢复。见「报告保留策略」 |
 | 没有每日 06:00 自动运行 | 需启动常驻 `scheduler.py`（`python scheduler.py --run-now`）；关闭窗口或 `Ctrl+C` 即停止 |

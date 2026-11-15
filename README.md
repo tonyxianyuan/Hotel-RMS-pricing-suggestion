@@ -283,9 +283,12 @@ rate. When the absolute ceiling binds, the run logs a `[WARN]` naming the stay
 date, the factor and the headroom that would have been allowed.
 
 Before anything is published, `price_guard.find_violations()` re-checks the
-priced frame: every price column must be finite, `Final_ADR` must sit inside
-`MIN_ADR`/`MAX_ADR` (half a currency unit of tolerance for the final rounding),
-`MAX_ADR` must exceed `MIN_ADR`, and no stay date / room type may appear twice.
+priced frame: all seven price columns (`MIN_ADR`, `MAX_ADR`,
+`Recommended_ADR`, `Model_ADR_Before_Adjustments`,
+`Post_Model_Adjustment_Factor`, `Final_ADR`, `Expected_RevPAR`) must be
+finite, `Final_ADR` must sit inside `MIN_ADR`/`MAX_ADR` (half a currency unit
+of tolerance for the final rounding), `MAX_ADR` must exceed `MIN_ADR`,
+`MIN_ADR` must be positive, and no stay date / room type may appear twice.
 A violation stops the run with exit code `3` and writes `[ERROR]` lines to the
 log instead of publishing rates that contradict their own guard.
 
@@ -330,12 +333,12 @@ next section for the optional HTTP client.
 
 ## Data sources (honest status)
 
-| Input | `DEMO` | `LIVE_PMS_SYNTHETIC_MARKET` |
-| --- | --- | --- |
-| Reservations / occupancy | Synthetic, anchored to the run date | Live PMS v1.3 |
-| Competitor ADR | Deterministic synthetic hash per stay date | Deterministic synthetic hash per stay date |
-| Baseline ADR | Constant `BASELINE_ADR` | Constant `BASELINE_ADR` |
-| Holidays / events | `Public holidays.csv` (staff-maintained) | `Public holidays.csv` (staff-maintained) |
+| Input | `DEMO` | `LIVE_PMS_SYNTHETIC_MARKET` | `PMS_FALLBACK_SYNTHETIC_MARKET` |
+| --- | --- | --- | --- |
+| Reservations / occupancy | Synthetic, anchored to the run date | Live PMS v1.3 | Synthetic fallback (at least one PMS read failed or stayed pending) |
+| Competitor ADR | Deterministic synthetic hash per stay date | Deterministic synthetic hash per stay date | Deterministic synthetic hash per stay date |
+| Baseline ADR | Constant `BASELINE_ADR` | Constant `BASELINE_ADR` | Constant `BASELINE_ADR` |
+| Holidays / events | `Public holidays.csv` (staff-maintained) | `Public holidays.csv` (staff-maintained) | `Public holidays.csv` (staff-maintained) |
 
 `deterministic_competitor_adr()` and `BASELINE_ADR` in `hotel rms.py` are the
 two replacement points for a real rate-shopper feed and a real historical ADR
@@ -429,63 +432,41 @@ above.
 
 ## Generated outputs
 
-Each run creates two reports in the **script folder**, whichever directory the
-engine was started from:
+Each run writes two CSV reports into the **script folder**, no matter which
+directory launched the engine:
 
-- `hotel_name_Live_Dashboard_YYYY-MM-DD.csv` - technical view, 34 columns:
-  the original 20 (`Stay_Date`, `Room_Type`, `Day_of_Week`, `Event_Name`,
-  `Event_Category`, `Event_Factor`, `Event_Source`, `Days_to_Checkin`,
-  `Current_Occupancy`, `Pace_Ratio`, `Base_Room_ADR`, `Competitor_ADR`,
-  `Recommended_ADR`, `MIN_ADR`, `MAX_ADR`, `Rate_Cap_Applied`, `Final_ADR`,
-  `Expected_RevPAR`, `Confidence_Score`, `Data_Mode`) plus 12 audit columns:
-  `RoomType_Factor`, `Weekend_Factor`, `Effective_Occupancy`,
-  `Current_OTB_Rooms`, `Hist_OTB_At_Same_LeadTime`, `Occupancy_Factor`,
-  `Lead_Time_Factor`, `Booking_Pace_Factor`, `Competitor_Ratio`,
-  `Competitor_Factor`, `Model_ADR_Before_Adjustments`,
-  `Post_Model_Adjustment_Factor`, the provenance column `Data_Sources`, and
-  `Run_Timestamp`. `Recommended_ADR` is the value before guarding; it can be
-  reproduced by multiplying `Base_Room_ADR` by `Weekend_Factor`,
-  `Event_Factor`, `Occupancy_Factor`, `Lead_Time_Factor`,
-  `Booking_Pace_Factor`, `Competitor_Factor` and
-  `Post_Model_Adjustment_Factor`. `Model_ADR_Before_Adjustments` is that
-  product before the same-day adjustments.
-- `hotel_name_RMS_Manager_View_YYYY-MM-DD.csv` - manager view, 12 columns:
-  `Stay_Date`, `Room_Type`, `Current_Occupancy`, `Final_ADR`,
-  `ADR_Change_vs_Base`, `Demand_Status`, `Action`, `Confidence_Score`,
-  `Reason`, `Data_Mode`, `Data_Sources`, `Run_Timestamp`.
+| Report | View | Columns to know |
+| --- | --- | --- |
+| `hotel_name_Live_Dashboard_YYYY-MM-DD.csv` | Technical, 34 columns | Per-day factors, guard flags, `Recommended_ADR`, `Data_Mode`, `Data_Sources`, `Run_Timestamp` |
+| `hotel_name_RMS_Manager_View_YYYY-MM-DD.csv` | Manager, 12 columns | `Stay_Date`, `Room_Type`, `Final_ADR`, `ADR_Change_vs_Base`, `Demand_Status`, `Action`, `Reason`, `Confidence_Score`, `Data_Mode`, `Data_Sources`, `Run_Timestamp` |
 
-`Data_Sources` states which inputs were real:
-`baseline=constant_synthetic`, `competitor=synthetic_hash`, and `dashboard=`
-/ `reservations=` as `demo_synthetic`, `synthetic_fallback` or `PMS_live`.
+`ADR_Change_vs_Base` and `Action` both use the displayed, rounded percentage.
 
-`Run_Timestamp` is one timestamp per cycle, written identically into both
-reports, so a consumer can prove the pair came from the same run. The UI
-compares the two values and warns when the files on screen come from
-different runs.
+### Reading the technical view
 
-Both are git-ignored. Reports are published atomically: each one is written to
-a private temporary file and then moved into place with a single `os.replace`.
-A reader never sees a half-written file, and several runs on the same day -
-including overlapping ones - never interleave bytes. If a report is open in
-Excel and cannot be overwritten, the engine instead publishes
-`..._YYYY-MM-DD_FALLBACK.csv` and logs a `[WARN]` line naming it. That single
-fallback name is reused by later runs, so the folder never accumulates
-timestamped copies.
+`Recommended_ADR` is the pre-guard rate. Rebuild it by multiplying
+`Base_Room_ADR` by `Weekend_Factor`, `Event_Factor`, `Occupancy_Factor`,
+`Lead_Time_Factor`, `Booking_Pace_Factor`, `Competitor_Factor` and
+`Post_Model_Adjustment_Factor`. `Model_ADR_Before_Adjustments` is that product
+before same-day adjustments. The 12 factor columns make every step auditable.
 
-Every cycle also appends its `[INFO]`, `[WARN]` and `[OK]` lines to
-`rms_run.log` in the script folder. The file is additive and git-ignored, and
-it survives closing the UI - so PMS fallbacks, calendar warnings and report
-publishing problems can still be audited afterwards.
+`Data_Sources` records what was actually used: `baseline=constant_synthetic`,
+`competitor=synthetic_hash`, and `dashboard=` / `reservations=` as
+`demo_synthetic`, `synthetic_fallback` or `PMS_live`. `Run_Timestamp` is
+identical in both reports, so the pair can be traced to one cycle; the UI
+warns if the two files on screen do not match.
 
-The staff UI strips `RMS_AS_OF_DATE` and `RMS_AS_OF_DATETIME` before starting
-the engine, so a back-test variable left in the shell cannot make a replay
-report appear as today's recommendation.
+### File names and safety
 
-The `Stay_Date` column inside both reports uses `YYYY/MM/DD`, matching the
-event calendar and the `RMS_AS_OF_DATE` variable. File names deliberately keep
-the ISO `YYYY-MM-DD` suffix: a slash (`/`) cannot appear in a Windows file
-name (the native Windows path separator is `\`). The staff UI locates reports
-with a regex that matches that suffix.
+- `Stay_Date` uses `YYYY/MM/DD`; file names keep the ISO `YYYY-MM-DD` suffix
+  because `/` is not allowed in Windows file names. The UI finds reports by
+  that suffix.
+- Reports are written atomically, never exposed half-written. If a report is
+  open in Excel, the engine saves `..._YYYY-MM-DD_FALLBACK.csv` and logs a
+  `[WARN]`; later runs reuse that name.
+- Cycle warnings and errors are appended to `rms_run.log` beside the reports.
+- The UI strips `RMS_AS_OF_DATE` / `RMS_AS_OF_DATETIME` before launching the
+  engine, so a leftover back-test setting cannot pass as today's rates.
 
 ### Report retention
 
@@ -512,8 +493,9 @@ result.
 | `python` is not recognised | Install Python 3.9+ and put it on `PATH`, or use the `.bat` launchers (they fall back to `py`). |
 | `ModuleNotFoundError` | Run `pip install pandas numpy requests schedule`; add `tzdata` on Windows if you use named timezones. The UI also reports missing packages in its log box. |
 | `[ERROR] Event calendar not found` | Confirm `Public holidays.csv` exists beside the scripts. If it is missing, restore it from version control or recreate it with the header shown in **Columns**; the engine will not produce rates from an incomplete calendar. |
-| An error names a calendar line number | Fix that row in `Public holidays.csv` and run again. Bare `MM-DD` dates and non-positive or non-numeric factors are rejected. |
+| An error names a calendar line number | Fix that row in `Public holidays.csv` and run again. Bare `MM-DD` dates and non-numeric, non-finite or non-positive factors are rejected. |
 | Reports are not where you expected | They are written to the script folder. Check the `[OK] ... written: <path>` line in the log for the exact location. |
+| Reports from earlier dates are missing | Older report dates were moved, not deleted, into `archive/` under the script folder. Drag a file back out to restore it; see [Report retention](#report-retention). |
 | No automatic 06:00 run | A scheduler process must be running (`python scheduler.py --run-now`). It stays resident; close its window or press `Ctrl+C` to stop it. |
 | `Timezone data not available` in the UI | Run `pip install tzdata`, then reopen the UI; or keep `Follow local system time`. |
 | Excel shows dates differently | See the **Excel note** above and format the `Date` column as Text. |
