@@ -5,12 +5,18 @@ Compare a candidate folder against a frozen baseline. Reports are aligned by
 (Stay_Date, Room_Type); only columns present in the baseline are compared, so
 a later cycle that ADDS columns (for example factor columns) is still valid.
 
+The candidate is pinned to the baseline's own file name. Comparing "the newest
+report in each folder" would silently diff one stay date against another and
+report a phantom regression as soon as somebody runs the engine on a new day.
+
 Usage:
-    py golden/diff_reports.py --baseline golden/v0/reports --candidate .
-    py golden/diff_reports.py --baseline golden/v0/reports --candidate . --strict
+    py golden/diff_reports.py --baseline golden/v7/reports --candidate output
+    py golden/diff_reports.py --baseline golden/v7/reports --candidate output --strict
 
 --strict fails when any price-bearing column changed. Use it as the gate for
-every change that must leave the pricing numbers untouched.
+every change that must leave the pricing numbers untouched. Reproduce the
+baseline's fixed inputs first, otherwise there is simply no candidate report
+for that stay date and the tool says so.
 
 This tool never writes, imports the pricing engine, or modifies any report.
 Standard library only; all output is English.
@@ -36,13 +42,30 @@ PRICE_BEARING = frozenset((
 ))
 
 
-def pick(folder, prefix):
+def pick(folder, prefix, wanted=None):
+    """Return ``(path, names)``.
+
+    ``wanted`` pins an exact file name. The candidate side must always be
+    pinned to the baseline's own file name: picking "the newest report" there
+    compares one stay date against another and reports a phantom regression
+    the moment somebody runs the tool on a newer day.
+    """
     names = sorted(n for n in os.listdir(folder)
                    if n.startswith(prefix) and n.endswith(".csv"))
     if not names:
         return None, []
-    newest = max(names, key=lambda n: os.path.getmtime(os.path.join(folder, n)))
-    return os.path.join(folder, newest), names
+    if wanted is None:
+        newest = max(names, key=lambda n: os.path.getmtime(os.path.join(folder, n)))
+        return os.path.join(folder, newest), names
+    if wanted in names:
+        return os.path.join(folder, wanted), names
+    # Excel can hold the canonical file open; the writer then publishes a
+    # fixed _FALLBACK name. Accept it, but only for the same stay date.
+    stem, extension = os.path.splitext(wanted)
+    alternative = "{}_FALLBACK{}".format(stem, extension)
+    if alternative in names:
+        return os.path.join(folder, alternative), names
+    return None, names
 
 
 def load(path):
@@ -96,14 +119,24 @@ def main():
     result = {}
     for label, prefix in (("technical", TECH_PREFIX), ("manager", MGR_PREFIX)):
         before, before_names = pick(args.baseline, prefix)
-        after, after_names = pick(args.candidate, prefix)
-        if not before or not after:
-            result[label] = {"error": "missing report",
-                             "baseline_files": before_names,
-                             "candidate_files": after_names}
+        if not before:
+            result[label] = {"error": "missing baseline report",
+                             "baseline_files": before_names}
+            continue
+        expected = os.path.basename(before)
+        after, after_names = pick(args.candidate, prefix, wanted=expected)
+        if not after:
+            result[label] = {
+                "error": ("candidate has no report for the baseline stay date; "
+                          "expected {} (or its _FALLBACK copy) in {}".format(
+                              expected, args.candidate)),
+                "expected": expected,
+                "baseline_files": before_names,
+                "candidate_files": after_names,
+            }
             continue
         result[label] = {
-            "baseline": os.path.basename(before),
+            "baseline": expected,
             "candidate": os.path.basename(after),
             "baseline_file_count": len(before_names),
             "candidate_file_count": len(after_names),

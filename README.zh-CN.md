@@ -21,7 +21,7 @@
 | `Start_Pricing_UI.bat` | Windows：打开界面 |
 | `User_Guide.txt` | 操作员速查（英文） |
 | `HANDOVER.md` | 交接状态：已验证什么、哪些输入仍是合成数据、哪些是有意不做的 |
-| `tests/` | 九份行为契约与 `run_all.py`：各自把项目复制到沙箱再断言行为，不是 pytest，也不依赖引擎以外的库 |
+| `tests/` | 十份行为契约与 `run_all.py`：各自把项目复制到沙箱再断言行为，不是 pytest，也不依赖引擎以外的库 |
 | `golden/` | 冻结的单次定价快照（`v7` 为当前基线，`v0` 为纠偏前参照）与只读比对工具 |
 | `output/` | 运行期生成：两份报告、`rms_run.log`、`rms_scheduler.log` 与 `archive/`，已被 git 忽略 |
 
@@ -237,7 +237,7 @@ PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：
 系统承诺的每一项行为都有一份契约覆盖，放在 `tests/`。它们不是 pytest，而是普通脚本：各自把项目复制到临时沙箱、运行真实入口再断言结果，因此运行它们不会影响 `output/`：
 
 ```bat
-py tests/run_all.py                 :: 九份全部，约 80 秒
+py tests/run_all.py                 :: 十份全部，约 90 秒
 py tests/run_all.py --only step7    :: 只跑一份
 ```
 
@@ -247,7 +247,7 @@ py tests/run_all.py --only step7    :: 只跑一份
 py golden/diff_reports.py --baseline golden/v7/reports --candidate output --strict
 ```
 
-任何价格列变动时 `--strict` 返回退出码 1。不该影响价格的改动必须报 0 差异；应该影响价格的改动必须能证明价差集合是封闭的。`tests/README.txt` 说明每份契约防的是什么，`HANDOVER.md` 记录当前状态。
+任何价格列变动时 `--strict` 返回退出码 1。不该影响价格的改动必须报 0 差异；应该影响价格的改动必须能证明价差集合是封闭的。候选目录按**基线自己的入住日期**配对，因此今天再跑一次引擎也不会让闸门拿另一天的报表去比。`tests/README.txt` 说明每份契约防的是什么，`HANDOVER.md` 记录当前状态。
 
 
 ## 数据来源

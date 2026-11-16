@@ -23,7 +23,9 @@ with pandas installed):
   1. Reproduce the same fixed inputs:
        RMS_AS_OF_DATE=2026/11/15 RMS_AS_OF_DATETIME="2026-11-15 17:00:00" py "hotel rms.py"
 
-  2. Compare the freshly written reports with the current baseline:
+  2. Compare the freshly written reports with the current baseline. The
+     candidate is pinned to the baseline's own stay date, so step 1 is not
+     optional: without it there is simply no report for that date.
        py golden/diff_reports.py --baseline golden/v7/reports --candidate output --strict
 
      --strict returns exit code 1 when any price-bearing column changed.

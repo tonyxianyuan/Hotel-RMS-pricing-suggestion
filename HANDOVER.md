@@ -41,7 +41,7 @@ scheduler). Reusable logic lives in `rms_core/`.
   stops the run with a calendar line number; a rate that breaks its own floor or
   ceiling is never published (exit code 3).
 - Dirty PMS rows are dropped with a warning naming the reservation, not fatal.
-- Nine behaviour contracts cover all of the above (`tests/`, see section 4).
+- Ten behaviour contracts cover all of the above (`tests/`, see section 4).
 
 ---
 
@@ -82,7 +82,7 @@ Do not put these rates in front of a revenue manager as advice.
 ## 4. How to verify a change
 
 ```bat
-py tests/run_all.py                 :: nine contracts, ~80 seconds
+py tests/run_all.py                 :: ten contracts, ~90 seconds
 ```
 
 Each contract copies the project into a temp sandbox and asserts behaviour; it
@@ -96,7 +96,10 @@ py golden/diff_reports.py --baseline golden/v7/reports --candidate output --stri
 ```
 
 `golden/v7` is the frozen output after the last pricing corrections; `golden/v0`
-is the pre-correction reference, kept so that change stays auditable. A change
+is the pre-correction reference, kept so that change stays auditable. The tool
+pins the candidate to the baseline's own stay date, so a newer report sitting in
+`output/` cannot masquerade as a regression, and a missing date is reported as a
+missing date rather than as changed prices. A change
 that is not supposed to move prices must produce zero price-bearing diffs. A
 change that IS supposed to move prices must close its delta set: undoing the
 documented rules has to reproduce the previous baseline exactly (this is how

@@ -26,6 +26,11 @@ shell, so a leftover back-test setting cannot bias a run.
 
 WHAT EACH CONTRACT PROTECTS
 
+  gate      The regression gate itself: it pins the candidate to the
+            baseline's own stay date, so a newer report in `output/` can
+            never be compared against the baseline as if it were a
+            regression, and a genuinely missing date is reported as such.
+
   layout    Only three entry points live beside the code; reusable modules are
             inside `rms_core/`; the engine still runs when launched from a
             different working directory.

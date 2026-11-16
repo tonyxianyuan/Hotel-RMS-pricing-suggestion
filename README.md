@@ -44,7 +44,7 @@ condensed copy of the calendar rules in its comment header.
 | `Start_Pricing_UI.bat` | Windows: open the staff UI |
 | `User_Guide.txt` | Short operator guide |
 | `HANDOVER.md` | Closing state: what was verified, what is still synthetic, what was deliberately left out |
-| `tests/` | Nine behaviour contracts plus `run_all.py`; each copies the project to a sandbox and asserts behaviour. Not pytest, no dependencies beyond the engine's own |
+| `tests/` | Ten behaviour contracts plus `run_all.py`; each copies the project to a sandbox and asserts behaviour. Not pytest, no dependencies beyond the engine's own |
 | `golden/` | Frozen snapshots of one pricing cycle (`v7` current, `v0` pre-correction) and the read-only diff tool |
 | `output/` | Generated at run time: the two reports, `rms_run.log`, `rms_scheduler.log` and `archive/`. Git-ignored |
 
@@ -411,7 +411,7 @@ sandbox, runs the real entry points and asserts the outcome, so running them
 never touches `output/`:
 
 ```bat
-py tests/run_all.py                 :: all nine, about 80 seconds
+py tests/run_all.py                 :: all ten, about 90 seconds
 py tests/run_all.py --only step7    :: one contract
 ```
 
@@ -423,7 +423,9 @@ py golden/diff_reports.py --baseline golden/v7/reports --candidate output --stri
 
 `--strict` returns exit code 1 if any price column moved. A change that is not
 meant to affect prices must report zero diffs; a change that is must be able to
-prove its delta set is closed. `tests/README.txt` maps each contract to the
+prove its delta set is closed. The candidate is pinned to the baseline's own
+stay date, so running the engine today cannot make the gate compare today's
+report against a different day's baseline. `tests/README.txt` maps each contract to the
 failure it exists to catch, and `HANDOVER.md` records the current state.
 
 PowerShell: `$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`.
