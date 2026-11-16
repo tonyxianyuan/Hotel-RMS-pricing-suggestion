@@ -13,6 +13,9 @@ __pycache__/
 *_Live_Dashboard_*.csv
 *_RMS_Manager_View_*.csv
 
+# Everything the tool writes at run time: reports, logs, archive/
+output/
+
 # Local timezone preference (written by the staff UI)
 timezone_settings.json
 timezone_settings.json.tmp

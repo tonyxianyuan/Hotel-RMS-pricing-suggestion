@@ -41,14 +41,15 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
-from event_calendar import (  # noqa: E402
+from rms_core import paths  # noqa: E402
+from rms_core.event_calendar import (  # noqa: E402
     CalendarError,
     describe_coverage,
     load_event_calendar,
 )
-from price_guard import find_violations  # noqa: E402
-from report_writer import publish_report  # noqa: E402
-from timezone_config import (  # noqa: E402
+from rms_core.price_guard import find_violations  # noqa: E402
+from rms_core.report_writer import publish_report  # noqa: E402
+from rms_core.timezone_config import (  # noqa: E402
     format_utc_offset,
     load_timezone,
     parse_property_now,
@@ -65,7 +66,7 @@ for _stream in (sys.stdout, sys.stderr):
 # ==========================================
 # 0. CONFIGURATION
 # ==========================================
-CALENDAR_FILE = os.path.join(APP_DIR, "Public holidays.csv")
+CALENDAR_FILE = paths.CALENDAR_FILE
 
 # Credentials are read from the environment, never hard-coded here.
 API_KEY = os.environ.get("PMS_API_KEY", "YOUR_PMS_API_KEY_HERE")
@@ -158,7 +159,7 @@ WINDOW_START = TODAY
 WINDOW_END = TODAY + pd.Timedelta(days=PRICING_WINDOW_DAYS - 1)
 
 
-RUN_LOG_FILE = os.path.join(APP_DIR, "rms_run.log")
+RUN_LOG_FILE = paths.RUN_LOG_FILE
 
 
 def _append_run_log(line):
@@ -168,6 +169,7 @@ def _append_run_log(line):
     the same day, and separate processes must not hold a shared file handle.
     """
     try:
+        paths.ensure_output_dir()
         stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
         with open(RUN_LOG_FILE, "a", encoding="utf-8") as handle:
             handle.write("{} {}\n".format(stamp, line))
@@ -197,6 +199,22 @@ def log_error(message):
     line = "[ERROR] {}".format(message)
     print(line)
     _append_run_log(line)
+
+
+# Move anything generated before output/ existed into output/. This has to run
+# before the first log line is written: otherwise output/rms_run.log would
+# already exist and the older log would be left behind in the program folder.
+try:
+    _moved, _skipped = paths.migrate_legacy_output()
+except Exception as _exc:  # never abort a pricing cycle over a tidy-up
+    _moved, _skipped = [], ["could not move old files into output/ ({})".format(_exc)]
+if _moved:
+    log_info(
+        "Moved {} generated file(s) from the program folder into output/.".format(
+            len(_moved)))
+if _skipped:
+    for _message in _skipped:
+        log_warn("output/ migration: {}".format(_message))
 
 
 # ==========================================
@@ -752,8 +770,8 @@ run_timestamp = NOW.strftime("%Y-%m-%dT%H:%M:%S%z")
 df_dashboard["Run_Timestamp"] = run_timestamp
 # Publish by absolute path: the reports belong next to the scripts, not in
 # whichever directory happened to launch the engine.
-tech_filename = os.path.join(
-    APP_DIR, "hotel_name_Live_Dashboard_{}.csv".format(date_suffix))
+tech_filename = paths.report_path(
+    "hotel_name_Live_Dashboard_{}.csv".format(date_suffix))
 tech_name, tech_status, tech_message = publish_report(df_dashboard, tech_filename)
 if tech_status == "ok":
     log_ok("Technical view written: {}".format(tech_name))
@@ -880,8 +898,8 @@ df_manager_view["Data_Mode"] = DATA_MODE
 df_manager_view["Data_Sources"] = DATA_SOURCES
 
 df_manager_view["Run_Timestamp"] = run_timestamp
-manager_filename = os.path.join(
-    APP_DIR, "hotel_name_RMS_Manager_View_{}.csv".format(date_suffix))
+manager_filename = paths.report_path(
+    "hotel_name_RMS_Manager_View_{}.csv".format(date_suffix))
 mgr_name, mgr_status, mgr_message = publish_report(df_manager_view, manager_filename)
 if mgr_status == "ok":
     log_ok("Manager view written: {}".format(mgr_name))
@@ -901,8 +919,9 @@ log_info("Pricing cycle complete. Data mode: {}".format(DATA_MODE))
 # 7. REPORT RETENTION (soft-delete; exactly one call per process)
 # ==========================================
 # All four launch paths converge on this process. Both reports are published
-# into APP_DIR by absolute path, so the retention scan MUST use APP_DIR too,
-# regardless of the directory this process was started from.
+# into output/ by absolute path, so the retention scan MUST use that same
+# folder, regardless of the directory this process was started from. Its own
+# archive/ subfolder therefore also lives inside output/.
 if AS_OF_OVERRIDE or AS_OF_DATETIME_OVERRIDE:
     # Back-testing / training / year-over-year replay: skip the whole action,
     # so a replay report is never archived and real dailies are never judged
@@ -912,13 +931,13 @@ else:
     try:
         # Lazy import on purpose: a missing or broken retention module must
         # never abort a pricing cycle whose two CSVs are already written.
-        # APP_DIR was added to sys.path at L41-42, so this import works
-        # regardless of the launch directory.
-        from report_retention import apply_retention  # noqa: E402
+        # The package folder is on sys.path, so this works regardless of the
+        # launch directory.
+        from rms_core.report_retention import apply_retention  # noqa: E402
 
         _emit = {"INFO": log_info, "OK": log_ok, "WARN": log_warn}
         for _level, _message in apply_retention(
-            output_dir=APP_DIR, today=NOW.date()
+            output_dir=paths.OUTPUT_DIR, today=NOW.date()
         ):
             _emit.get(_level, log_info)("[RETENTION] {}".format(_message))
     except Exception as _exc:

@@ -31,7 +31,11 @@ report look like today's recommendation.
 DAILY WORKFLOW
 --------------
 1. Double-click "Start_Pricing_UI.bat" to open the app window.
-2. Click "Run Pricing Now" (top-left).
+   If a report already exists, it is loaded straight away and the top bar says
+   "Data generated: <time>". That time is when the report was written, not
+   when you opened the window - so you can tell at a glance how old it is.
+2. Click "Run Pricing Now" (top-left). The button changes to "Running..." and
+   "Cancel Run" becomes available.
 3. Wait for the log box at the bottom to say "[OK] Pricing finished".
    The table refreshes with recommended rates for the next 90 days, by room
    type.
@@ -45,6 +49,21 @@ DAILY WORKFLOW
      as well; the detail line spells out the data basis)
 5. Use the "Show" and "Room type" dropdowns above the table to filter by date
    range or room type. The separate "Timezone" dropdown is described below.
+
+IF A RUN DOES NOT FINISH
+------------------------
+- Wrong input: a red notice appears reading "RESULTS NOT UPDATED - showing
+  data from <time>", the freshness label turns red, and the log box explains
+  the cause (an invalid calendar row, for example). The rows on screen are the
+  PREVIOUS result. Fix the file and run again; never publish those numbers as
+  today's rates.
+- The same red notice appears if the engine stops for any other reason. The
+  log box names the reason: "Stopped by an input error" (exit 2), "Stopped by
+  the price guard" (exit 3) or an unexpected failure.
+- "Cancel Run" stops a run you started by mistake. The table is left exactly
+  as it was, because a cancelled run is not a failed one.
+- Closing the window during a run asks you to confirm and then stops the
+  engine, so nothing keeps writing reports in the background.
 
 TIMEZONE (SECOND ROW, UNDER THE BUTTONS)
 ---------------------------------------
@@ -149,7 +168,7 @@ reused on later runs, so repeated cycles never pile up extra files.
 RUN LOG
 -------
 Every cycle also appends its [INFO], [WARN] and [OK] lines to "rms_run.log"
-in the script folder. It is additive and stays after you close the UI, so
+inside the "output" folder. It is additive and stays after you close the UI, so
 PMS fallbacks, calendar warnings and report publishing problems can be
 checked later. The file is git-ignored. The technical view CSV also carries
 the individual factor columns, so a rate can be checked by multiplying
@@ -157,9 +176,9 @@ Base_Room_ADR by the factors.
 
 REPORT RETENTION
 ----------------
-Only the 3 newest report dates stay in the script folder. Older reports,
-including the ..._YYYY-MM-DD_FALLBACK.csv copies, are MOVED to an
-"archive" subfolder - they are NOT deleted. Drag a file back out of that
+Only the 3 newest report dates stay in the "output" folder. Older reports,
+including the ..._YYYY-MM-DD_FALLBACK.csv copies, are MOVED into the
+"output\archive" subfolder - they are NOT deleted. Drag a file back out of that
 folder to restore it. Set RMS_REPORT_KEEP to change how many dates are kept.
 Set RMS_REPORT_RETENTION_DRY_RUN=1 to preview the list without moving
 anything. Training or back-test runs (RMS_AS_OF_DATE / RMS_AS_OF_DATETIME)
@@ -189,7 +208,7 @@ and stable market conditions.
 PREFER NOT TO USE THE WINDOW?
 -----------------------------
 Double-click "Run_Pricing_Now.bat" to run one pricing cycle directly. Reports
-are always written into the script folder, so it no longer matters which
+are always written into the "output" folder, so it no longer matters which
 directory you start the engine from. The .bat file switches to the script
 folder first anyway.
 
@@ -217,12 +236,12 @@ Q: Nothing happens / an error in the log?
    administrator.
 Q: A result file is open in Excel - will it fail?
    No. The engine saves to ..._YYYY-MM-DD_FALLBACK.csv and logs its name.
-   Look for that file in the script folder. Clicking Run again is safe: the
+   Look for that file in the "output" folder. Clicking Run again is safe: the
    same fallback name is reused, so no extra files pile up.
 Q: Where did yesterday's report go?
-   It is in the "archive" subfolder. Reports are MOVED, not deleted - drag
-   the file back into the script folder if you need it in the UI again.
-   Only the 3 newest report dates are kept in the script folder.
+   It is in the "output\archive" subfolder. Reports are MOVED, not deleted - drag
+   the file back into the "output" folder if you need it in the UI again.
+   Only the 3 newest report dates are kept in the "output" folder.
 Q: The rate looks lower than the base rate on a holiday?
    Check the factor cards: demand, booking pace and same-day discounts can
    outweigh the event uplift. The Special Event card confirms the event factor

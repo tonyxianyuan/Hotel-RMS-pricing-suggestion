@@ -10,7 +10,8 @@ import schedule
 
 # Make companion imports robust when this file is started from another folder.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from timezone_config import (  # noqa: E402
+from rms_core import paths  # noqa: E402
+from rms_core.timezone_config import (  # noqa: E402
     config_mtime, load_timezone, local_time_for,
 )
 
@@ -18,10 +19,12 @@ from timezone_config import (  # noqa: E402
 # 1. LOGGING CONFIGURATION
 # ==========================================
 # Resolve every path from this file so the scheduler works no matter which
-# directory it was started from.
+# directory it was started from. Generated files live in output/, like every
+# other artefact the tool produces.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RMS_SCRIPT = os.path.join(SCRIPT_DIR, "hotel rms.py")
-LOG_FILE = os.path.join(SCRIPT_DIR, "rms_scheduler.log")
+paths.ensure_output_dir()
+LOG_FILE = paths.SCHEDULER_LOG_FILE
 
 log_formatter = logging.Formatter("%(asctime)s\n%(message)s\n", datefmt="%Y-%m-%d %H:%M")
 logger = logging.getLogger("RMSScheduler")

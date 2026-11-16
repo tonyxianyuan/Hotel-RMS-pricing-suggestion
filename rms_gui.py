@@ -15,16 +15,28 @@ All UI labels, log messages, comments and report text are English.
 
 import csv
 import os
+import queue
 import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from datetime import datetime
 from tkinter import ttk, messagebox
 
-from timezone_config import (
+# ==========================================
+# Path setup (works no matter where the app is launched from)
+# ==========================================
+# This must run before the package import below: when the UI is imported from
+# another folder, the script folder is not automatically on sys.path.
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+
+from rms_core import paths  # noqa: E402
+from rms_core.timezone_config import (  # noqa: E402
     choice_labels,
     choice_values,
     format_clock,
@@ -35,12 +47,10 @@ from timezone_config import (
     tz_available,
 )
 
-# ==========================================
-# Path setup (works no matter where the app is launched from)
-# ==========================================
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
 RMS_SCRIPT = os.path.join(APP_DIR, "hotel rms.py")
-CALENDAR_FILE = os.path.join(APP_DIR, "Public holidays.csv")
+CALENDAR_FILE = paths.CALENDAR_FILE
+# Reports, logs and archive/ all live in output/, never beside the code.
+OUTPUT_DIR = paths.OUTPUT_DIR
 
 DOW_EN = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
 
@@ -52,10 +62,18 @@ def read_csv_rows(path):
 
 
 def find_latest_csv(pattern, folder=None):
-    """Find the newest result CSV matching the filename pattern."""
-    folder = folder or APP_DIR
+    """Find the newest result CSV matching the filename pattern.
+
+    Defaults to output/, which is the only place the engine publishes reports.
+    A missing folder means "no reports yet", not an error to show the user.
+    """
+    folder = folder or OUTPUT_DIR
     candidates = []
-    for name in os.listdir(folder):
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    for name in names:
         if re.match(pattern, name):
             full = os.path.join(folder, name)
             candidates.append((os.path.getmtime(full), full))
@@ -188,6 +206,34 @@ def load_latest_results():
     return records
 
 
+def describe_engine_exit(code):
+    """Return (kind, message) for a finished pricing engine process.
+
+    Exit codes are a public contract with the engine: 0 is success, 2 means an
+    input file was rejected before pricing, 3 means the price guard refused to
+    publish. Anything else is an unexpected crash. Naming the actual cause is
+    what stops a failure from reading like a slow success.
+    """
+    if code == 0:
+        return "ok", "Pricing finished."
+    if code == 2:
+        return "input", (
+            "Stopped by an input error: a calendar row or a configuration value "
+            "is invalid. The log above names the file and line. No report was "
+            "written."
+        )
+    if code == 3:
+        return "guard", (
+            "Stopped by the price guard: a computed rate failed its own floor, "
+            "ceiling or duplicate-key check, so nothing was published. Check the "
+            "log above for the affected stay dates."
+        )
+    return "failed", (
+        "The pricing engine failed (exit code {}). No new report was written; "
+        "check the log above.".format(code)
+    )
+
+
 def parse_change_pct(change_str):
     """Parse '+12.5%' / '-8.3%' into a float; return None on failure."""
     if not change_str:
@@ -205,10 +251,20 @@ class RMSApp:
         self.records = []
         self.running = False
         self._tz_dirty = False
+        self._proc = None
+        self._cancel_requested = False
+        self._closed = False
+        self.results_stale = False
+        # Tk is not thread-safe: a worker that calls root.after() from a
+        # non-main thread raises "main thread is not in main loop" and the
+        # message is lost. Worker threads only ever put work on this queue;
+        # the main thread drains it on a timer.
+        self._ui_queue = queue.Queue()
 
         root.title("Hotel Pricing Assistant")
         root.geometry("1180x760")
         root.minsize(980, 620)
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         style = ttk.Style()
         try:
@@ -227,6 +283,23 @@ class RMSApp:
         self.build_detail_panel()
         self.build_status_bar()
 
+        # Move anything generated before output/ existed, so the UI and the
+        # engine always agree on where reports live. Idempotent and logged.
+        try:
+            moved, skipped = paths.migrate_legacy_output()
+        except Exception as exc:
+            moved, skipped = [], ["could not move old files into output/ ({})".format(exc)]
+        for name in moved:
+            self.log("[INFO] Moved {} into output/.".format(name))
+        for message in skipped:
+            self.log("[WARN] output/ migration: {}".format(message))
+
+        # Show whatever the last run already produced. Staff usually open this
+        # window after the scheduled 06:00 run, so an empty screen would look
+        # like the tool never ran at all.
+        self.load_results(quiet=True)
+        self._schedule_drain()
+
         # Check the runtime environment in the background on startup.
         threading.Thread(target=self.check_environment, daemon=True).start()
 
@@ -239,6 +312,11 @@ class RMSApp:
             top, text="Run Pricing Now", style="Run.TButton", command=self.run_pricing
         )
         self.run_btn.pack(side="left")
+
+        self.cancel_btn = ttk.Button(
+            top, text="Cancel Run", command=self.cancel_run, state="disabled"
+        )
+        self.cancel_btn.pack(side="left", padx=(8, 0))
 
         ttk.Button(
             top, text="Open Event Calendar", command=self.open_event_calendar
@@ -272,6 +350,12 @@ class RMSApp:
             top, text="", foreground="#b26a00", font=("Segoe UI", 9, "bold")
         )
         self.mode_lbl.pack(side="right")
+        # Separate from mode_lbl on purpose: a failed run must shout that the
+        # table is out of date without erasing the DEMO / fallback warning.
+        self.stale_lbl = ttk.Label(
+            top, text="", foreground="#b00020", font=("Segoe UI", 9, "bold")
+        )
+        self.stale_lbl.pack(side="right", padx=(0, 12))
         self.last_run_lbl = ttk.Label(
             top,
             text="(Not run yet - click the button to start)",
@@ -450,7 +534,44 @@ class RMSApp:
         )
         self.status.pack(fill="x", padx=12, pady=(0, 10))
 
+    def _post(self, callback, *args):
+        """Hand work from a worker thread to the Tk main thread.
+
+        Only a thread-safe queue operation happens here, so a reader thread can
+        never touch Tk directly. Once the window is closed the work is simply
+        dropped, which is what stops the shutdown tracebacks.
+        """
+        if self._closed:
+            return
+        self._ui_queue.put((callback, args))
+
+    def _schedule_drain(self):
+        if self._closed:
+            return
+        try:
+            self.root.after(40, self._drain_queue)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _drain_queue(self):
+        """Run queued worker callbacks on the main thread, then re-arm."""
+        if self._closed:
+            return
+        while True:
+            try:
+                callback, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(*args)
+            except tk.TclError:
+                # A widget disappeared while the callback was queued.
+                pass
+        self._schedule_drain()
+
     def log(self, msg):
+        if self._closed:
+            return
         self.status.configure(state="normal")
         self.status.insert("end", msg + "\n")
         self.status.see("end")
@@ -459,12 +580,10 @@ class RMSApp:
     # ---------- Environment check ----------
     def check_environment(self):
         if not os.path.isfile(CALENDAR_FILE):
-            self.root.after(
-                0,
-                lambda: self.log(
-                    "[WARN] Event calendar not found: {}. The pricing run will stop "
-                    "until the file is restored.".format(CALENDAR_FILE)
-                ),
+            self._post(
+                self.log,
+                "[WARN] Event calendar not found: {}. The pricing run will stop "
+                "until the file is restored.".format(CALENDAR_FILE),
             )
         try:
             result = subprocess.run(
@@ -474,26 +593,22 @@ class RMSApp:
                 timeout=60,
             )
             if result.returncode == 0:
-                self.root.after(
-                    0,
-                    lambda: self.log(
-                        "[OK] Environment check passed (pandas / numpy / requests ready)"
-                    ),
+                self._post(
+                    self.log,
+                    "[OK] Environment check passed (pandas / numpy / requests ready)",
                 )
             else:
-                self.root.after(
-                    0,
-                    lambda: self.log(
-                        "[WARN] Missing Python packages (pandas / numpy / requests).\n"
-                        "       To fix: press Win+R, type cmd, then run\n"
-                        '       "{}" -m pip install pandas numpy requests'.format(
-                            sys.executable
-                        )
+                self._post(
+                    self.log,
+                    "[WARN] Missing Python packages (pandas / numpy / requests).\n"
+                    "       To fix: press Win+R, type cmd, then run\n"
+                    '       "{}" -m pip install pandas numpy requests'.format(
+                        sys.executable
                     ),
                 )
         except Exception as exc:
-            self.root.after(
-                0, lambda: self.log("[WARN] Environment check failed: {}".format(exc))
+            self._post(
+                self.log, "[WARN] Environment check failed: {}".format(exc)
             )
 
     # ---------- Event calendar ----------
@@ -522,9 +637,12 @@ class RMSApp:
     # ---------- Run pricing ----------
     def run_pricing(self):
         if self.running:
+            self.log("[INFO] A pricing run is already in progress.")
             return
         self.running = True
-        self.run_btn.configure(state="disabled")
+        self._cancel_requested = False
+        self.run_btn.configure(state="disabled", text="Running...")
+        self.cancel_btn.configure(state="normal")
         self.log(
             "[RUN] {} Running pricing engine, please wait...".format(
                 resolve_now(load_timezone()).strftime("%H:%M:%S")
@@ -545,44 +663,167 @@ class RMSApp:
             )
         except Exception as exc:
             self.log("[ERROR] Failed to start pricing engine: {}".format(exc))
-            self.running = False
-            self.run_btn.configure(state="normal")
+            self._finish_run()
             return
+
+        self._proc = proc
 
         def reader():
             for line in proc.stdout:
-                self.root.after(0, self.log, line.rstrip())
+                self._post(self.log, line.rstrip())
             code = proc.wait()
-            self.root.after(0, lambda: self.on_run_finished(code))
+            self._post(self.on_run_finished, code)
 
         threading.Thread(target=reader, daemon=True).start()
 
-    def on_run_finished(self, code):
+    def cancel_run(self):
+        """Stop the running engine without closing the window."""
+        if not self.running:
+            return
+        self._cancel_requested = True
+        self.log("[WARN] Cancelling the pricing run...")
+        self.cancel_btn.configure(state="disabled")
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            return
+        # terminate() is not guaranteed to take effect; escalate in case the
+        # child is blocked on I/O and ignores it.
+        self.root.after(5000, self._force_kill, proc)
+
+    def _force_kill(self, proc):
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def _finish_run(self):
+        """Return the controls to their idle state. Safe to call twice."""
         self.running = False
-        self.run_btn.configure(state="normal")
-        if code == 0:
-            self.log("[OK] Pricing finished, loading results...")
-            self.load_results()
-        else:
-            self.log(
-                "[ERROR] Pricing engine failed. Check the log above or contact "
-                "your system administrator."
-            )
-        if self._tz_dirty:
+        self._proc = None
+        if self._closed:
+            return
+        self.run_btn.configure(state="normal", text="Run Pricing Now")
+        self.cancel_btn.configure(state="disabled")
+
+    def on_run_finished(self, code):
+        cancelled = self._cancel_requested
+        self._cancel_requested = False
+        self._finish_run()
+
+        if cancelled:
+            # A deliberate stop is not a failure, and the numbers on screen are
+            # still the last completed run, so they are not marked stale. A
+            # pending timezone re-run is dropped too: restarting the run the
+            # user just cancelled would be the opposite of what they asked for.
             self._tz_dirty = False
-            self.root.after(0, self.run_pricing)
+            self.log(
+                "[WARN] Pricing run cancelled. The results on screen were not "
+                "changed."
+            )
+        else:
+            kind, message = describe_engine_exit(code)
+            if kind == "ok":
+                self.log("[OK] Pricing finished, loading results...")
+                self.load_results()
+            else:
+                self.log("[ERROR] {}".format(message))
+                self.mark_results_stale()
+
+            if self._tz_dirty:
+                self._tz_dirty = False
+                self._post(self.run_pricing)
+
+    def mark_results_stale(self):
+        """Keep the rows visible but make it impossible to read them as current.
+
+        Blanking the table would hide the previous recommendation and leave
+        staff guessing; labelling it stale keeps their context and still tells
+        the truth about what is on screen.
+        """
+        self.results_stale = True
+        generated = latest_report_timestamp()
+        shown = format_clock(generated) if generated else "an earlier run"
+        self.stale_lbl.configure(
+            text="RESULTS NOT UPDATED - showing data from {}".format(shown)
+        )
+        self.last_run_lbl.configure(
+            text="STALE - last updated {}".format(shown), foreground="#b00020"
+        )
+        self.log(
+            "[WARN] The table below still shows {} and must not be treated as "
+            "today's recommendation.".format(shown)
+        )
+
+    def on_close(self):
+        """Close the window, stopping a run in flight first.
+
+        Without this the child keeps pricing into the report folder after the
+        window is gone, so the next person sees data nobody watched being made.
+        """
+        if self.running:
+            if not messagebox.askyesno(
+                "Pricing Is Running",
+                "A pricing run is still in progress.\n\n"
+                "Stop it and close the window?",
+            ):
+                return
+            self._stop_child_blocking()
+        self._closed = True
+        self.root.destroy()
+
+    def _stop_child_blocking(self):
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            return
+        for _ in range(50):
+            if proc.poll() is not None:
+                return
+            time.sleep(0.1)
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
     # ---------- Load / display results ----------
-    def load_results(self):
+    def load_results(self, quiet=False):
+        """Load the newest reports into the table.
+
+        quiet=True is the startup path: no modal dialogs, because a fresh
+        installation has no reports yet and a popup on every launch would
+        train staff to dismiss warnings without reading them.
+        """
         try:
             records = load_latest_results()
         except Exception as exc:
-            messagebox.showerror("Load Failed", "Error reading result files:\n{}".format(exc))
+            if quiet:
+                self.log("[WARN] Could not read the existing result files: {}".format(exc))
+            else:
+                messagebox.showerror(
+                    "Load Failed", "Error reading result files:\n{}".format(exc))
             return
         if not records:
-            messagebox.showwarning(
-                "No Results",
-                'No pricing result files found.\nPlease click "Run Pricing Now" first.',
+            if quiet:
+                self.log(
+                    "[INFO] No result files yet. Click Run Pricing Now to produce "
+                    "the first report."
+                )
+            else:
+                messagebox.showwarning(
+                    "No Results",
+                    'No pricing result files found.\nPlease click "Run Pricing Now" first.',
+                )
+            self.last_run_lbl.configure(
+                text="(No results yet - click Run Pricing Now)",
+                foreground="#666666",
             )
             return
 
@@ -595,11 +836,15 @@ class RMSApp:
         mismatch = report_pair_mismatch()
         if mismatch:
             self.log("[WARN] {}".format(mismatch))
+        # Freshly loaded data is current again, so the stale notice goes away.
+        self.results_stale = False
+        self.stale_lbl.configure(text="")
         generated = latest_report_timestamp()
         self.last_run_lbl.configure(
             text="Data generated: {}".format(
                 format_clock(generated) if generated else "unknown"
-            )
+            ),
+            foreground="#666666",
         )
         self.log(
             "[INFO] Loaded {} rate recommendations. Click any row to see why it "

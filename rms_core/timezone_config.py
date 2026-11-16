@@ -22,8 +22,11 @@ try:
 except ImportError:  # pragma: no cover - Python 3.8 and older
     ZoneInfo = None
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(APP_DIR, "timezone_settings.json")
+# The settings file belongs next to the entry points, not inside this package.
+# Deriving it from this file's own location would put it in rms_core/.
+from .paths import TIMEZONE_SETTINGS_FILE
+
+CONFIG_FILE = TIMEZONE_SETTINGS_FILE
 CONFIG_TMP_FILE = CONFIG_FILE + ".tmp"
 SCHEMA_VERSION = 1
 
