@@ -29,17 +29,15 @@ PRICE_COLUMNS = (
 )
 KEY_COLUMNS = ("Stay_Date", "Room_Type")
 
-# Final_ADR is rounded to whole currency units after np.clip(), so a rate may
-# legitimately sit up to half a unit outside its own floor. Anything larger is
-# a genuine breach of the guard rather than a rounding artefact.
+# The engine now rounds a rate to whole currency units AFTER clipping and then
+# clamps the result into the whole-unit band [ceil(min), floor(max)], so a
+# published rate can never sit outside the floor or ceiling it advertises. That
+# makes this check exact: no tolerance hides a real breach any more.
 #
-# This tolerance exists because of a known ordering flaw that is still in the
-# engine: np.clip() raises a rate to MIN_ADR and the following .round(0) can
-# then bank round it back below, e.g. MIN_ADR 94.5 becomes Final_ADR 94.0.
-# The tolerance keeps this check honest about real breaches without hiding
-# that flaw; fixing the ordering is a pricing-semantics change and belongs to
-# a separate, price-approved step.
-ROUNDING_TOLERANCE = 0.5
+# Earlier versions carried a 0.5 tolerance because the engine clipped first and
+# bank-rounded afterwards, which could publish MIN_ADR 94.5 as Final_ADR 94.0.
+# The tolerance is gone with that ordering.
+ROUNDING_TOLERANCE = 0.0
 _FLOAT_SLACK = 1e-9
 
 
@@ -89,7 +87,7 @@ def find_violations(frame):
     below = final < floor - ROUNDING_TOLERANCE - _FLOAT_SLACK
     if below.any():
         problems.append(
-            "Final_ADR is below MIN_ADR beyond rounding on {} row(s), first at {} "
+            "Final_ADR is below MIN_ADR on {} row(s), first at {} "
             "(final {} vs floor {})".format(
                 int(below.sum()), _labels(frame, below),
                 float(final[below].iloc[0]), float(floor[below].iloc[0])
@@ -99,7 +97,7 @@ def find_violations(frame):
     above = final > ceiling + ROUNDING_TOLERANCE + _FLOAT_SLACK
     if above.any():
         problems.append(
-            "Final_ADR is above MAX_ADR beyond rounding on {} row(s), first at {} "
+            "Final_ADR is above MAX_ADR on {} row(s), first at {} "
             "(final {} vs ceiling {})".format(
                 int(above.sum()), _labels(frame, above),
                 float(final[above].iloc[0]), float(ceiling[above].iloc[0])

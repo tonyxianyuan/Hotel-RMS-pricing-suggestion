@@ -43,6 +43,9 @@ condensed copy of the calendar rules in its comment header.
 | `Run_Pricing_Now.bat` | Windows: run one pricing cycle |
 | `Start_Pricing_UI.bat` | Windows: open the staff UI |
 | `User_Guide.txt` | Short operator guide |
+| `HANDOVER.md` | Closing state: what was verified, what is still synthetic, what was deliberately left out |
+| `tests/` | Nine behaviour contracts plus `run_all.py`; each copies the project to a sandbox and asserts behaviour. Not pytest, no dependencies beyond the engine's own |
+| `golden/` | Frozen snapshots of one pricing cycle (`v7` current, `v0` pre-correction) and the read-only diff tool |
 | `output/` | Generated at run time: the two reports, `rms_run.log`, `rms_scheduler.log` and `archive/`. Git-ignored |
 
 Inside `rms_core/`:
@@ -159,10 +162,32 @@ for you. Reports are always published into **`output/`**, whichever directory th
 engine was started from.
 
 ```bat
-python "hotel rms.py"          # one pricing cycle -> two CSV reports
-python rms_gui.py              # staff UI (click "Run Pricing Now")
+Run_Pricing_Now.bat --check    # diagnose: which interpreter, are the packages there?
+Run_Pricing_Now.bat            # one pricing cycle -> two CSV reports
+Start_Pricing_UI.bat           # staff UI (click "Run Pricing Now")
+python "hotel rms.py"          # the same cycle, if you want to run Python yourself
+python rms_gui.py              # the same UI, from a terminal you control
 python scheduler.py --run-now  # one cycle now, then stay resident for daily 06:00 runs
 ```
+
+### Why the `.bat` files do not just call `python`
+
+`where python` proves that a *name* exists, not that the interpreter behind it
+can import `pandas`. Machines with several Python installations - including
+the development machine for this project - very often have a `python` on
+`PATH` with no packages, while `py` points at a complete one. Double-clicking
+`Run_Pricing_Now.bat` then failed with `ModuleNotFoundError` in a window that
+closed before it could be read.
+
+Both launchers therefore start `rms_core/launcher.py`, which probes each
+candidate interpreter (`py -3`, `py`, `python`, `python3`, then the one
+running the launcher) by actually importing the three packages, and uses the
+first one that succeeds. It prints which interpreter it picked, and if none
+works it lists every interpreter it tried, the reason each failed, and the
+exact `pip install` command - then waits for a key press instead of vanishing.
+
+`--check` runs the whole check without starting anything. `RMS_NO_PAUSE=1`
+suppresses the closing key prompt, for unattended use.
 
 `scheduler.py --run-now` does **not** return after the first cycle: it keeps
 running to serve the daily job. Leave its window open and press `Ctrl+C` to
@@ -291,13 +316,33 @@ Base_Room_ADR     = BASELINE_ADR x RoomType_Factor
                     (Standard 135 x 1.00 = 135; Premium 160 x 1.25 = 200)
 Recommended_ADR   = Base_Room_ADR x Weekend x Event_Factor x Occupancy
                          x Lead_Time x Booking_Pace x Competitor
-Final_ADR         = round(clip(Recommended_ADR, MIN_ADR, MAX_ADR), 0)
+Final_ADR         = clamp(floor(clamp(Recommended_ADR, MIN, MAX) + 0.5),
+                          ceil(MIN), floor(MAX))
 ```
 
 The factor tables (weekend, occupancy, pace, lead time, competitor), the
 same-day time-decay layer and the guest-density surcharge are defined in
 `hotel rms.py`. "Baseline" in this document always means the shipped
 `BASELINE_ADR` configuration, not a previous release of the tool.
+
+Three details decide a rate as much as the factor tables do:
+
+- **Occupancy has one definition.** `Current_Occupancy` is the only occupancy
+  figure in the engine, and `Effective_Occupancy` is now by definition the same
+  number. Net of blocked rooms, and on day 0 taken from the live dashboard
+  because rooms sold for tonight are already occupied rather than "on the
+  books". A row can no longer display 80% occupancy while pricing at 0%.
+- **Booking pace needs a denominator.** `Pace_Basis` says whether the ratio was
+  actually measured. When last year's comparable date carries no bookings at
+  all, the basis is `no_history` and the pace factor is neutral `1.00` — the
+  engine does not invent a denominator of 1 and call it "10% behind pace".
+- **Guest density is a same-day signal.** Guests per occupied room describes
+  who is in the building tonight, so the surcharge only applies to arrivals
+  with `Days_to_Checkin = 0`. It never reprices next month.
+
+A rate is published in whole currency units and always inside its own band:
+the engine rounds half up and then clamps to `[ceil(MIN_ADR), floor(MAX_ADR)]`,
+so `MIN_ADR = 94.5` can never be published as `94`.
 
 Rate guards give event days extra headroom so a strong event factor is not
 clipped by the generic ceiling, but the headroom itself has a hard limit:
@@ -324,11 +369,11 @@ Before anything is published, `price_guard.find_violations()` re-checks the
 priced frame: all seven price columns (`MIN_ADR`, `MAX_ADR`,
 `Recommended_ADR`, `Model_ADR_Before_Adjustments`,
 `Post_Model_Adjustment_Factor`, `Final_ADR`, `Expected_RevPAR`) must be
-finite, `Final_ADR` must sit inside `MIN_ADR`/`MAX_ADR` (half a currency unit
-of tolerance for the final rounding), `MAX_ADR` must exceed `MIN_ADR`,
-`MIN_ADR` must be positive, and no stay date / room type may appear twice.
-A violation stops the run with exit code `3` and writes `[ERROR]` lines to the
-log instead of publishing rates that contradict their own guard.
+finite, `Final_ADR` must sit inside `MIN_ADR`/`MAX_ADR` with **no** rounding
+tolerance (the whole-unit clamp above guarantees it), `MAX_ADR` must exceed
+`MIN_ADR`, `MIN_ADR` must be positive, and no stay date / room type may appear
+twice. A violation stops the run with exit code `3` and writes `[ERROR]` lines
+to the log instead of publishing rates that contradict their own guard.
 
 ## Reproducibility
 
@@ -357,6 +402,29 @@ as a PMS timestamp, not as a calendar date:
 set RMS_AS_OF_DATETIME=2026-09-01 22:30:00
 python "hotel rms.py"
 ```
+
+## Verification
+
+Every behaviour the system promises is covered by a contract in `tests/`. They
+are ordinary scripts, not pytest: each copies the project into a temporary
+sandbox, runs the real entry points and asserts the outcome, so running them
+never touches `output/`:
+
+```bat
+py tests/run_all.py                 :: all nine, about 80 seconds
+py tests/run_all.py --only step7    :: one contract
+```
+
+Price-bearing changes are guarded separately by a frozen baseline:
+
+```bat
+py golden/diff_reports.py --baseline golden/v7/reports --candidate output --strict
+```
+
+`--strict` returns exit code 1 if any price column moved. A change that is not
+meant to affect prices must report zero diffs; a change that is must be able to
+prove its delta set is closed. `tests/README.txt` maps each contract to the
+failure it exists to catch, and `HANDOVER.md` records the current state.
 
 PowerShell: `$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`.
 On bash / macOS: `export RMS_AS_OF_DATETIME="2026-09-01 22:30:00"`.
@@ -475,7 +543,7 @@ launched the engine. Nothing generated is ever written beside the code:
 
 | Report | View | Columns to know |
 | --- | --- | --- |
-| `hotel_name_Live_Dashboard_YYYY-MM-DD.csv` | Technical, 34 columns | Per-day factors, guard flags, `Recommended_ADR`, `Data_Mode`, `Data_Sources`, `Run_Timestamp` |
+| `hotel_name_Live_Dashboard_YYYY-MM-DD.csv` | Technical, 36 columns | Per-day factors, `Pace_Basis`, guard flags, `Recommended_ADR`, `Data_Mode`, `Data_Sources`, `Run_Timestamp` |
 | `hotel_name_RMS_Manager_View_YYYY-MM-DD.csv` | Manager, 12 columns | `Stay_Date`, `Room_Type`, `Final_ADR`, `ADR_Change_vs_Base`, `Demand_Status`, `Action`, `Reason`, `Confidence_Score`, `Data_Mode`, `Data_Sources`, `Run_Timestamp` |
 
 `ADR_Change_vs_Base` and `Action` both use the displayed, rounded percentage.
@@ -486,7 +554,17 @@ launched the engine. Nothing generated is ever written beside the code:
 `Base_Room_ADR` by `Weekend_Factor`, `Event_Factor`, `Occupancy_Factor`,
 `Lead_Time_Factor`, `Booking_Pace_Factor`, `Competitor_Factor` and
 `Post_Model_Adjustment_Factor`. `Model_ADR_Before_Adjustments` is that product
-before same-day adjustments. The 12 factor columns make every step auditable.
+before same-day adjustments. The 14 factor columns make every step auditable.
+
+`Pace_Basis` states how much evidence the pace ratio rests on:
+
+| Value | Meaning | Pace factor |
+| --- | --- | --- |
+| `measured` | Last year's comparable date had bookings, and `Hist_OTB_At_Same_LeadTime` is the count on the books at the same lead time | `Pace_Ratio = Current_OTB_Rooms / Hist_OTB_At_Same_LeadTime` |
+| `no_history` | `Hist_Pool_Nights` is 0 — there is no comparable date to divide by | neutral `1.00` |
+
+`Hist_Pool_Nights` is the raw number of room-nights sold for the same date one
+year earlier, so "no data" and "no bookings" can be told apart.
 
 `Data_Sources` records what was actually used: `baseline=constant_synthetic`,
 `competitor=synthetic_hash`, and `dashboard=` / `reservations=` as
@@ -532,8 +610,9 @@ only `output/`, so archived reports are not shown as the latest result.
 
 | Symptom | What to check |
 | --- | --- |
-| `python` is not recognised | Install Python 3.9+ and put it on `PATH`, or use the `.bat` launchers (they fall back to `py`). |
-| `ModuleNotFoundError` | Run `pip install pandas numpy requests schedule`; add `tzdata` on Windows if you use named timezones. The UI also reports missing packages in its log box. |
+| `python` is not recognised | Install Python 3.9+ and put it on `PATH`. The `.bat` launchers try `py -3`, `py`, `python` and `python3` in turn. |
+| `[ERROR] No Python interpreter with the required packages` | The launchers could not find a usable interpreter. The message lists every interpreter tried and the failure for each; run the quoted `pip install pandas numpy requests` command, or install Python from python.org with "Add python.exe to PATH" ticked. |
+| `ModuleNotFoundError` when running `python "hotel rms.py"` directly | That `python` is not the interpreter with the packages. Run `Run_Pricing_Now.bat --check` to see the one that works, or use the `.bat` launcher. The UI also reports missing packages in its log box. |
 | `[ERROR] Event calendar not found` | Confirm `Public holidays.csv` exists beside the scripts. If it is missing, restore it from version control or recreate it with the header shown in **Columns**; the engine will not produce rates from an incomplete calendar. |
 | An error names a calendar line number | Fix that row in `Public holidays.csv` and run again. Bare `MM-DD` dates and non-numeric, non-finite or non-positive factors are rejected. |
 | Reports are not where you expected | They are written to `output/`. Check the `[OK] ... written: <path>` line in the log for the exact location. |

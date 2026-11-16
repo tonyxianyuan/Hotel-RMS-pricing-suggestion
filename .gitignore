@@ -20,8 +20,14 @@ output/
 timezone_settings.json
 timezone_settings.json.tmp
 
-# Local regression baseline and its read-only diff tool
-golden/
+# Local regression baseline. Tracked on purpose: the frozen reports are the
+# behavioural specification the contracts check against, and the manifests hold
+# only SHA-256 digests, never local paths. Generated reports elsewhere stay
+# ignored (see the patterns above), so the baseline reports are re-included here
+# explicitly.
+!golden/
+!golden/v0/reports/*.csv
+!golden/v7/reports/*.csv
 
 # Agent / assistant working data and chat logs - never commit
 # (also enforced machine-wide via the global core.excludesfile)

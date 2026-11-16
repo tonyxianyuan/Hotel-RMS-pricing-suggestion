@@ -1,0 +1,17 @@
+[INFO] Connecting to PMS API v1.3 for dashboard metrics...
+[WARN] Dashboard unavailable (No PMS credentials configured). Using synthetic demo metrics.
+[INFO] Property timezone: local system time (UTC+8)
+[INFO] Property time: 2026-11-15 17:00:00
+[INFO] Run date: 2026/11/15 (RMS_AS_OF_DATE override)
+[INFO] Pricing window: 2026/11/15 .. 2027/02/12 (90 days)
+[INFO] Data mode: DEMO (synthetic PMS reservations, synthetic competitor rates, constant baseline ADR)
+[INFO] Connecting to PMS API v1.3 for reservation data...
+[WARN] Reservations unavailable (No PMS credentials configured). Using synthetic demo reservations.
+[INFO] Stay-night pace matrix built for 2 room types.
+[INFO] Loaded 5 event date(s) from Public holidays.csv inside the pricing window.
+[OK] Technical view written: hotel_name_Live_Dashboard_2026-11-15.csv
+[INFO] Compiling the manager view...
+[OK] Manager view written: hotel_name_RMS_Manager_View_2026-11-15.csv
+[INFO] Event-affected rows: 10 of 180; rate cap applied to 39 rows.
+[INFO] Pricing cycle complete. Data mode: DEMO
+[INFO] [RETENTION] skipped: a reproducibility override is active.

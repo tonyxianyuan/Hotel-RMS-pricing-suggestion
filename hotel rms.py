@@ -49,6 +49,10 @@ from rms_core.event_calendar import (  # noqa: E402
 )
 from rms_core.price_guard import find_violations  # noqa: E402
 from rms_core.report_writer import publish_report  # noqa: E402
+from rms_core.reservations import (  # noqa: E402
+    expand_stay_nights,
+    parse_reservations,
+)
 from rms_core.timezone_config import (  # noqa: E402
     format_utc_offset,
     load_timezone,
@@ -278,6 +282,35 @@ if PROPERTY_NOW_WARNING:
     log_warn(PROPERTY_NOW_WARNING)
 PROPERTY_NOW_STR = PROPERTY_NOW.strftime("%Y-%m-%d %H:%M:%S")
 
+# Blocked rooms are not sellable, so they are removed from every occupancy
+# denominator. One capacity definition, used by both the occupancy figure and
+# the occupancy factor, so a row can never report 80% and price 0%.
+if CAPACITY <= 0:
+    log_warn(
+        "PMS reported a sellable capacity of {}, which is not usable; assuming "
+        "1 room so the cycle can still produce a recommendation. Check the "
+        "dashboard integration.".format(CAPACITY)
+    )
+ACTIVE_CAPACITY = max(1, CAPACITY - ROOMS_BLOCKED)
+
+
+def clamp_percentage(value):
+    """Clamp an occupancy figure into 0-100, treating garbage as 0%."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(number):
+        return 0.0
+    return min(max(number, 0.0), 100.0)
+
+
+def occupancy_from_rooms(rooms, capacity):
+    """Occupancy percentage for a room count, safe when capacity is zero."""
+    if capacity <= 0:
+        return 0.0
+    return clamp_percentage((rooms / capacity) * 100)
+
 
 # ==========================================
 # 2. PMS RESERVATION ADAPTER (v1.3 -> df_pace)
@@ -319,67 +352,45 @@ def fetch_and_build_pace():
     reservations_list = (
         json_data.get("data", json_data) if isinstance(json_data, dict) else json_data
     )
-    parsed_reservations = []
-    for res in sorted(reservations_list, key=lambda item: item.get("startDate", "")):
-        status = str(res.get("status", "")).lower().strip()
-        if status not in ("confirmed", "checked_in", "checked_out"):
-            continue
-        created_raw = res.get("dateCreated", "")
-        created_date = (
-            pd.to_datetime(created_raw).date() if created_raw else AS_OF_DATE
-        )
-        parsed_reservations.append(
-            {
-                "Reservation_ID": res.get("reservationID"),
-                "Created_Date": created_date,
-                "CheckIn_Date": pd.to_datetime(res.get("startDate")).date(),
-                "CheckOut_Date": pd.to_datetime(res.get("endDate")).date(),
-                "Status": status,
-            }
-        )
-
-    df_res = pd.DataFrame(parsed_reservations)
-    expanded_nights = []
-    for _, row in df_res.iterrows():
-        current_stay_date = row["CheckIn_Date"]
-        while current_stay_date < row["CheckOut_Date"]:
-            expanded_nights.append(
-                {
-                    "Stay_Date": current_stay_date,
-                    "Created_Date": row["Created_Date"],
-                }
-            )
-            current_stay_date += timedelta(days=1)
-
-    df_nights = pd.DataFrame(expanded_nights)
-    if not df_nights.empty:
-        df_nights["Stay_Date"] = pd.to_datetime(df_nights["Stay_Date"])
-        df_nights["Created_Date"] = pd.to_datetime(df_nights["Created_Date"])
+    # Parsing and expansion live in rms_core.reservations so they can be tested
+    # without running a pricing cycle. A malformed booking is dropped with a
+    # named warning instead of raising outside this function's try block and
+    # killing the whole run before a single rate is produced.
+    parsed_reservations = parse_reservations(
+        reservations_list, AS_OF_DATE, warn=log_warn
+    )
+    df_nights = expand_stay_nights(parsed_reservations, warn=log_warn)
 
     future_dates = pd.date_range(TODAY, periods=PRICING_WINDOW_DAYS)
     pace_rows = []
     for s_date in future_dates:
         for r_type in BASELINE_ADR:
             hist_adr = BASELINE_ADR[r_type]
+            current_otb = 0
+            hist_pool_nights = 0
+            hist_otb_at_leadtime = 0
+            lead_time_days = (s_date - TODAY).days
             if not df_nights.empty:
                 current_otb = len(df_nights[df_nights["Stay_Date"] == s_date])
-                lead_time_days = (s_date - TODAY).days
                 hist_stay_date = s_date - pd.DateOffset(years=1)
                 hist_checkpoint_date = hist_stay_date - pd.DateOffset(days=lead_time_days)
                 hist_pool = df_nights[df_nights["Stay_Date"] == hist_stay_date]
+                # The raw count matters: 0 means "we had no booking for that
+                # date last year", which is different from "we had no data".
+                # Collapsing both into a denominator of 1 is what used to turn
+                # a missing history into a 10% discount on every quiet date.
+                hist_pool_nights = len(hist_pool)
                 hist_otb_at_leadtime = len(
                     hist_pool[hist_pool["Created_Date"] <= hist_checkpoint_date]
                 )
-            else:
-                current_otb = 0
-                hist_otb_at_leadtime = 0
-                lead_time_days = (s_date - TODAY).days
 
-            # Day 0 has no reliable OTB figure yet; use the live occupancy.
+            # Day 0 has no meaningful on-the-books figure: rooms sold for
+            # tonight are already occupied, not future arrivals. The live
+            # dashboard figure is the only honest source for today.
             current_occ = (
-                LIVE_TODAY_OCC
+                clamp_percentage(LIVE_TODAY_OCC)
                 if lead_time_days == 0
-                else (current_otb / CAPACITY) * 100
+                else occupancy_from_rooms(current_otb, ACTIVE_CAPACITY)
             )
             pace_rows.append(
                 {
@@ -388,7 +399,8 @@ def fetch_and_build_pace():
                     "Historical_ADR": float(hist_adr),
                     "Current_Occupancy": round(current_occ, 2),
                     "Current_OTB_Rooms": int(current_otb),
-                    "Hist_OTB_At_Same_LeadTime": int(max(1, hist_otb_at_leadtime)),
+                    "Hist_Pool_Nights": int(hist_pool_nights),
+                    "Hist_OTB_At_Same_LeadTime": int(hist_otb_at_leadtime),
                 }
             )
 
@@ -515,11 +527,13 @@ def get_business_weekend_factor(dow):
 
 df_model["Weekend_Factor"] = df_model["Day_of_Week"].apply(get_business_weekend_factor)
 
-# Net availability yielding: blocked rooms are removed from the denominator.
-active_capacity = max(1, CAPACITY - ROOMS_BLOCKED)
-df_model["Effective_Occupancy"] = (
-    df_model["Current_OTB_Rooms"] / active_capacity
-) * 100
+# ONE occupancy per row. Current_Occupancy is the single source of truth and
+# is already net of blocked rooms and already uses the live dashboard figure on
+# day 0. Effective_Occupancy is kept because older reports and the audit chain
+# carry it, but it is now by definition the same number. Recomputing it from
+# the on-the-books count is what used to price an 80%-occupied night at 0%
+# while the same row proudly displayed "80% / High Demand".
+df_model["Effective_Occupancy"] = df_model["Current_Occupancy"].astype(float)
 
 
 def get_occupancy_factor(occ):
@@ -538,18 +552,32 @@ df_model["Occupancy_Factor"] = df_model["Effective_Occupancy"].apply(
     get_occupancy_factor
 )
 
+# A pace ratio needs a denominator. When last year's comparable date carries no
+# bookings at all there is nothing to divide by, and inventing a denominator of
+# 1 turned "we cannot measure this" into "demand is 10% weak" on every quiet
+# date. The basis column makes the difference visible in the report instead.
+PACE_NO_HISTORY = "no_history"
+PACE_MEASURED = "measured"
+# Cap for the "we have bookings where history had none" case, which is a real
+# signal but has no finite ratio.
+PACE_AHEAD_OF_ZERO_HISTORY = 1.5
 
-def calculate_pace_ratio(row):
-    current = row["Current_OTB_Rooms"]
+
+def describe_pace(row):
+    """Return ``(ratio, basis)`` for one stay date."""
+    on_the_books = row["Current_OTB_Rooms"]
     hist = row["Hist_OTB_At_Same_LeadTime"]
-    if current == 0 and hist == 0:
-        return 1.0
-    if current > 0 and hist == 0:
-        return 1.5
-    return current / hist
+    pool = row["Hist_Pool_Nights"]
+    if pool <= 0:
+        return 1.0, PACE_NO_HISTORY
+    if hist <= 0:
+        return (PACE_AHEAD_OF_ZERO_HISTORY if on_the_books > 0 else 1.0), PACE_MEASURED
+    return on_the_books / hist, PACE_MEASURED
 
 
-df_model["Pace_Ratio"] = df_model.apply(calculate_pace_ratio, axis=1)
+_pace = df_model.apply(describe_pace, axis=1, result_type="expand")
+df_model["Pace_Ratio"] = _pace[0]
+df_model["Pace_Basis"] = _pace[1]
 
 
 def get_pace_factor(ratio):
@@ -636,8 +664,12 @@ def apply_advanced_optimizations(row):
                 adr *= 0.95
         else:
             adr *= 1.05
-    if guest_density > 2.5 and row["Effective_Occupancy"] >= 70:
-        adr *= 1.04
+        # Guest density describes who is in the building TONIGHT (guests per
+        # occupied room right now). Applying it to every future date repriced
+        # next month off a figure that will be different by then, so it is
+        # scoped to the same day it was measured on.
+        if guest_density > 2.5 and row["Effective_Occupancy"] >= 70:
+            adr *= 1.04
     return adr
 
 
@@ -660,9 +692,21 @@ df_model["Rate_Cap_Applied"] = (
     (df_model["Recommended_ADR"] > df_model["MAX_ADR"])
     | (df_model["Recommended_ADR"] < df_model["MIN_ADR"])
 )
+# Rates are published in whole currency units. The old ordering clipped a rate
+# up to its floor and then bank-rounded it, so a 94.5 floor could be published
+# as 94 - a rate below the minimum it advertises. Round half UP first, then
+# clamp to the whole-unit band [ceil(min), floor(max)], which keeps the rate
+# inside its own floor and ceiling by construction.
 df_model["Final_ADR"] = np.clip(
-    df_model["Recommended_ADR"], df_model["MIN_ADR"], df_model["MAX_ADR"]
-).round(0)
+    np.floor(
+        np.clip(
+            df_model["Recommended_ADR"], df_model["MIN_ADR"], df_model["MAX_ADR"]
+        )
+        + 0.5
+    ),
+    np.ceil(df_model["MIN_ADR"]),
+    np.floor(df_model["MAX_ADR"]),
+)
 df_model["Expected_RevPAR"] = (
     df_model["Final_ADR"] * (df_model["Current_Occupancy"] / 100)
 ).round(2)
@@ -747,10 +791,12 @@ output_cols = [
     "Weekend_Factor",
     "Effective_Occupancy",
     "Current_OTB_Rooms",
+    "Hist_Pool_Nights",
     "Hist_OTB_At_Same_LeadTime",
     "Occupancy_Factor",
     "Lead_Time_Factor",
     "Booking_Pace_Factor",
+    "Pace_Basis",
     "Competitor_Ratio",
     "Competitor_Factor",
     "Model_ADR_Before_Adjustments",

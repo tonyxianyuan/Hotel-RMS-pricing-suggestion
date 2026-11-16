@@ -1,0 +1,105 @@
+{
+  "baseline_id": "v7",
+  "supersedes": "v0",
+  "purpose": "Frozen regression baseline AFTER the pricing corrections of step 7. Any later change must reproduce these price columns exactly unless it is explicitly approved as a pricing-semantics change.",
+  "captured_at": "2026-11-16T20:57:51.911903+08:00",
+  "command": "RMS_AS_OF_DATE=2026/11/15 RMS_AS_OF_DATETIME=\"2026-11-15 17:00:00\" py \"hotel rms.py\"",
+  "fixed_environment": {
+    "RMS_AS_OF_DATE": "",
+    "RMS_AS_OF_DATETIME": "",
+    "PMS_API_KEY": "unset (DEMO)",
+    "PMS_BASE_URL": "unset (DEMO)",
+    "timezone_settings.json": "absent (machine local time, UTC+08:00)",
+    "RMS_REPORT_KEEP": "default 3 (retention skipped because an override is active)"
+  },
+  "runtime": {
+    "python": "3.14.10",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "pandas": "3.0.2",
+    "numpy": "2.4.4",
+    "python_executable": "python (path omitted)"
+  },
+  "inputs": {
+    "Public holidays.csv": {
+      "sha256": "f91197ae692845d475568b9474d58853d3b03adbf540fbd8dbfeb84454904a01"
+    }
+  },
+  "code_sha256": {
+    "hotel rms.py": "d4e0a76f4c42d339876b13f48ce25e3f86ceca85b195236da075fd6096e2593c",
+    "rms_gui.py": "199fdeeb809f75d64be4cd70d29eb54993940fb8f96892a3d596bc9d12462649",
+    "scheduler.py": "d5b3bc821a2f6e69c43ab3fbd184380d7dd901d45ecb39d9be809db8f2d86722",
+    "rms_core\\__init__.py": "1fa8b5817f8fef70913bd55cfb28f93af767d16edbfd1cec0fbc66553f9ddb3e",
+    "rms_core\\event_calendar.py": "3187dc4c31d71324a39efa6a4b11813cc7b85b2e580ebaf5272e94414ef15c1a",
+    "rms_core\\launcher.py": "f41c7950891108523acbdd183f61030e6b3040a7bf573c40e21f24907e164bb9",
+    "rms_core\\paths.py": "06a2cfd349df7dab7cea5cd460761414172570a9f978dd875dc5dc8da886cffa",
+    "rms_core\\price_guard.py": "a9f4b83075608099cdbe98be7189d5e83cdb9edb85db7a98ee19e7f48aaed73f",
+    "rms_core\\report_retention.py": "6be4969f8cdd706d05464e119246e04df5e45fe9a78cc82020cb31e00f6ef1d8",
+    "rms_core\\report_writer.py": "f7441c31848ff8fd9484fda2fd334256c045b1c8a31703af869ffec15c214c64",
+    "rms_core\\reservations.py": "4a7f97b925d0ae3f31fd4362e38b97e3f2765fbbe598e642898ad0261c874925",
+    "rms_core\\timezone_config.py": "faed52a2a5e76ed46d192e23c8ac5dd05e2df47af889743402b118ecf640d5b7"
+  },
+  "outputs": {
+    "hotel_name_Live_Dashboard_2026-11-15.csv": {
+      "sha256": "9c679822a50929022816b4f8766fc1be67afdbc220be637b04a5866ca841b244",
+      "data_rows": 180,
+      "columns": 36
+    },
+    "hotel_name_RMS_Manager_View_2026-11-15.csv": {
+      "sha256": "e7f13543484d00d850123a1f64630703034e29ca1c4218a43121fc7917a7aa64",
+      "data_rows": 180,
+      "columns": 12
+    }
+  },
+  "step_7_rules": [
+    {
+      "id": "R1",
+      "name": "pace ratio stops inventing a denominator",
+      "before": "Hist_OTB = max(1, raw) made Pace_Ratio equal the OTB room count",
+      "after": "raw history count is published; no history -> ratio 1.0, basis 'no_history'"
+    },
+    {
+      "id": "R2",
+      "name": "one occupancy per row",
+      "before": "day 0 displayed the live 80% but priced on an OTB-derived 0%",
+      "after": "Current_Occupancy is the only occupancy; Effective_Occupancy equals it"
+    },
+    {
+      "id": "R3",
+      "name": "whole-unit rate inside its own band",
+      "before": "clip then bank round published 94.0 against a 94.5 floor",
+      "after": "round half up, then clamp to [ceil(MIN), floor(MAX)]; guard tolerance 0"
+    },
+    {
+      "id": "R4",
+      "name": "guest density is a same-day signal",
+      "before": "today's guests-per-room repriced all 180 future dates when occupancy was high",
+      "after": "applied only to Days_to_Checkin == 0"
+    },
+    {
+      "id": "R5",
+      "name": "dirty PMS rows cannot kill a cycle",
+      "before": "an unparsable date raised outside the try block; the stay-night loop was unbounded",
+      "after": "rms_core.reservations drops and names bad rows, caps a stay at 365 nights"
+    }
+  ],
+  "reconciliation": {
+    "tool": "reconcile_v0.py (kept outside the repository)",
+    "result": "undoing R1-R4 reproduces every v0 Recommended_ADR and Final_ADR exactly",
+    "rows_compared": 180,
+    "mismatches": 0,
+    "rows_changed_vs_v0": 169,
+    "mean_change_pct": 10.47,
+    "delta_attribution_currency_total": {
+      "pace": 2475.69,
+      "occupancy": 103.24,
+      "density": 12.39,
+      "rounding": 113.24
+    }
+  },
+  "notes": [
+    "v0 remains on disk as the pre-correction reference; the gate uses v7.",
+    "Prices are frozen per baseline series; do not compare across different AS_OF_DATE values.",
+    "The demo feed has history for only 4 of 180 rows, so R1 dominates the v0 -> v7 delta."
+  ],
+  "stdout": "golden/v7/stdout.txt"
+}

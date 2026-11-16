@@ -1,0 +1,65 @@
+{
+  "baseline_id": "v0",
+  "purpose": "Frozen regression baseline. Any later change must reproduce these price columns exactly unless the change is explicitly approved as a pricing-semantics change.",
+  "captured_at": "2026-11-15T17:42:34.968818+08:00",
+  "command": "RMS_AS_OF_DATE=2026/11/15 RMS_AS_OF_DATETIME=\"2026-11-15 17:00:00\" py \"hotel rms.py\"",
+  "fixed_environment": {
+    "RMS_AS_OF_DATE": "",
+    "RMS_AS_OF_DATETIME": "",
+    "PMS_API_KEY": "unset (DEMO)",
+    "PMS_BASE_URL": "unset (DEMO)",
+    "timezone_settings.json": "absent (machine local time, UTC+08:00)",
+    "RMS_REPORT_KEEP": "default 3 (retention skipped because an override is active)"
+  },
+  "runtime": {
+    "python": "3.14.10",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "pandas": "3.0.2",
+    "numpy": "2.4.4",
+    "python_executable": "python (path omitted)"
+  },
+  "inputs": {
+    "Public holidays.csv": {
+      "sha256": "f91197ae692845d475568b9474d58853d3b03adbf540fbd8dbfeb84454904a01",
+      "snapshot": "golden/v0/inputs/Public holidays.csv",
+      "sha256_at_capture": "2f14ee3f1a76f813b0868865885080546572fe7cef47b442093e9b6f51514ec0",
+      "note": "Step 6 expanded the header comments only (new Event_Factor rules and maintenance warnings). Re-parsing both files for 2026-11-15..2027-02-12 returns an identical 5-row event frame, and the golden gate reports 0 price-bearing diffs."
+    }
+  },
+  "code_sha256": {
+    "hotel rms.py": "d9e471cb55889f785d1087337b6cba0e66655c737351705454b9b69c57281345",
+    "event_calendar.py": "913f5fa205e819002d3e1309c372937981d31c426a11cb7c023e199ef21befa2",
+    "timezone_config.py": "78df7d2be63f6de0207b3e5351200969e9810725e1afb4f6594b1e29e3f7949c",
+    "scheduler.py": "304af32b141500c4209b3f8098d2165f2db8d83f7b97b402ebfb34e02c73237e",
+    "rms_gui.py": "e465e67cc0e29b1d4bd23f509f0122190af63beb69738f4ade97d2ec4a41c367",
+    "report_retention.py": "6be4969f8cdd706d05464e119246e04df5e45fe9a78cc82020cb31e00f6ef1d8",
+    "report_writer.py": "ab4c3c3aa0e2c8dfe915ec03b316e6abc96e6232bc84726a4ffa2b0bd750b6ce"
+  },
+  "outputs": {
+    "hotel_name_Live_Dashboard_2026-11-15.csv": {
+      "sha256": "0bd60793c5bfcad5cc7f6df039f5d9a791420697206eefcdfa4701ad41fc74a9",
+      "data_rows": 180
+    },
+    "hotel_name_RMS_Manager_View_2026-11-15.csv": {
+      "sha256": "c9f5b47e243a8d90a9be07685d5b2de33b910bf71c79b5332e30a640fa59527e",
+      "data_rows": 180
+    }
+  },
+  "stdout": "golden/v0/stdout.txt",
+  "notes": [
+    "Prices are frozen for this baseline series; do not compare across different AS_OF_DATE values.",
+    "The diff tool compares only columns present in the baseline, so added columns are allowed.",
+    "A reproducibility override is active, therefore report retention is skipped for baseline runs."
+  ],
+  "amendments": [
+    {
+      "step": "6 (guardrail hardening)",
+      "file": "Public holidays.csv",
+      "change": "Header comments expanded; no data row added, removed or edited.",
+      "sha256_at_capture": "2f14ee3f1a76f813b0868865885080546572fe7cef47b442093e9b6f51514ec0",
+      "sha256_current": "f91197ae692845d475568b9474d58853d3b03adbf540fbd8dbfeb84454904a01",
+      "verification": "load_event_calendar() returns an identical 5-row frame for the frozen window; golden gate PASS with 0 price diffs.",
+      "baseline_reports_refreshed": false
+    }
+  ]
+}

@@ -45,6 +45,14 @@ DAILY WORKFLOW
    - Five factor cards: Special Event / Supply & Demand / Booking Pace /
      Competitor / Forecast RevPAR. The Special Event card shows the event
      factor from the calendar (for example "Factor: 1.50x").
+     The Supply & Demand card shows ONE occupancy figure - the same one the
+     price was built from. On today's row it is the live occupancy from the
+     dashboard, not the future-bookings count.
+     The Booking Pace card compares this date with the same date last year.
+     If last year has no bookings for that date it says "No booking history
+     for this date / Pace not measurable -> neutral (1.00x)". That means the
+     engine is NOT assuming demand is weak; it simply has nothing to compare,
+     so it neither raises nor lowers the rate for pace.
    - A confidence score out of 100 (below 70 means apply your own judgement
      as well; the detail line spells out the data basis)
 5. Use the "Show" and "Room type" dropdowns above the table to filter by date
@@ -234,6 +242,22 @@ Q: Nothing happens / an error in the log?
    Check that Python 3.9+ and pandas, numpy, requests (plus schedule for the
    scheduler) are installed. Then screenshot the log box and send it to the
    administrator.
+Q: A black window opened and closed too fast to read?
+   That was one of the .bat files. It no longer closes on failure: it now
+   stops with a message and waits for a key press. The message also names
+   which Python interpreter was tried and what to install.
+Q: How do I check the Python setup without running pricing?
+   Double-click "Run_Pricing_Now.bat" and add  --check  after it, or open a
+   command prompt in this folder and run:
+       Run_Pricing_Now.bat --check
+   It prints the interpreter in use, whether pandas / numpy / requests are
+   importable, and the program folder. Nothing is started or written.
+Q: The window says "[ERROR] No Python interpreter with the required packages"?
+   Send that text to the administrator. It lists every interpreter the
+   launcher tried and why each failed, plus the exact "pip install" command
+   to run. A common cause is several Python installations where "python" has
+   no packages while "py" does; the launcher normally picks the working one by
+   itself.
 Q: A result file is open in Excel - will it fail?
    No. The engine saves to ..._YYYY-MM-DD_FALLBACK.csv and logs its name.
    Look for that file in the "output" folder. Clicking Run again is safe: the

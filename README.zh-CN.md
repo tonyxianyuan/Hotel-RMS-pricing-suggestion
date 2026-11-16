@@ -20,6 +20,9 @@
 | `Run_Pricing_Now.bat` | Windows：运行一次定价 |
 | `Start_Pricing_UI.bat` | Windows：打开界面 |
 | `User_Guide.txt` | 操作员速查（英文） |
+| `HANDOVER.md` | 交接状态：已验证什么、哪些输入仍是合成数据、哪些是有意不做的 |
+| `tests/` | 九份行为契约与 `run_all.py`：各自把项目复制到沙箱再断言行为，不是 pytest，也不依赖引擎以外的库 |
+| `golden/` | 冻结的单次定价快照（`v7` 为当前基线，`v0` 为纠偏前参照）与只读比对工具 |
 | `output/` | 运行期生成：两份报告、`rms_run.log`、`rms_scheduler.log` 与 `archive/`，已被 git 忽略 |
 
 `rms_core/` 内部：
@@ -100,17 +103,28 @@ Python 3.9+：
 pip install pandas numpy requests schedule
 ```
 
-`schedule` 只供 `scheduler.py` 使用。`tkinter` 随 Windows / macOS 版 CPython 提供，部分 Linux 发行版需单独安装（如 `python3-tk`）。两个 `.bat` 要求 `python` 在 `PATH` 上，找不到时回退到 `py`。命名 IANA 时区需要系统时区数据库，Windows 上另装 `tzdata`；默认的 `Follow local system time` 无需额外依赖，也不需要 `pytz`。
+`schedule` 只供 `scheduler.py` 使用。`tkinter` 随 Windows / macOS 版 CPython 提供，部分 Linux 发行版需单独安装（如 `python3-tk`）。两个 `.bat` 不直接调用 `python`，而是先启动 `rms_core/launcher.py`，由它逐个探测解释器（`py -3`、`py`、`python`、`python3`，最后是运行 launcher 的那个）并选用第一个真能导入三个依赖的。详见「为什么 `.bat` 不直接调用 `python`」。命名 IANA 时区需要系统时区数据库，Windows 上另装 `tzdata`；默认的 `Follow local system time` 无需额外依赖，也不需要 `pytz`。
 
 ## 快速开始
 
 先 `cd` 到仓库目录，`.bat` 启动器会自动切换。报告始终写入 **`output/`** 文件夹，无论从哪个目录启动引擎。
 
 ```bat
-python "hotel rms.py"          # 运行一次，生成两份 CSV
-python rms_gui.py              # 打开界面，点 "Run Pricing Now"
+Run_Pricing_Now.bat --check    # 自检：用哪个解释器、依赖是否就绪
+Run_Pricing_Now.bat            # 运行一次，生成两份 CSV
+Start_Pricing_UI.bat           # 打开界面，点 "Run Pricing Now"
+python "hotel rms.py"          # 等价于上面的循环（自己用 Python 跑时）
+python rms_gui.py              # 等价于上面的界面
 python scheduler.py --run-now  # 先跑一次，然后常驻等待每日 06:00
 ```
+
+### 为什么 `.bat` 不直接调用 `python`
+
+`where python` 只能证明 PATH 上存在某个**名字**，不能证明它背后装了 `pandas`。一台机器装了多个 Python 时，PATH 里的 `python` 常常是没装依赖的那个，而 `py` 才指向完整的那个——本项目的开发机就是这种情况。此时双击 `Run_Pricing_Now.bat` 会在一个来不及看清的窗口里报 `ModuleNotFoundError` 然后消失。
+
+因此两个启动器都改为调用 `rms_core/launcher.py`：它逐个**真实导入**三个依赖来探测候选解释器（`py -3`、`py`、`python`、`python3`，最后是运行 launcher 的那个），采用第一个成功的；会打印选中的解释器；如果一个都不可用，则列出所有尝试过的解释器、各自的失败原因，以及确切的 `pip install` 命令，并停住等待按键而不是一闪而过。
+
+`--check` 只做检查、不启动任何东西。`RMS_NO_PAUSE=1` 可取消结尾的按键等待，便于无人值守调用。
 
 `scheduler.py --run-now` 跑完不会退出：需保持窗口，按 `Ctrl+C` 结束。没有常驻进程就没有每日 06:00 的自动运行。
 
@@ -169,10 +183,19 @@ Base_Room_ADR     = BASELINE_ADR x RoomType_Factor
                     (Standard 135 x 1.00 = 135; Premium 160 x 1.25 = 200)
 Recommended_ADR   = Base_Room_ADR x Weekend x Event_Factor x Occupancy
                          x Lead_Time x Booking_Pace x Competitor
-Final_ADR         = round(clip(Recommended_ADR, MIN_ADR, MAX_ADR), 0)
+Final_ADR         = clamp(floor(clamp(Recommended_ADR, MIN, MAX) + 0.5),
+                          ceil(MIN), floor(MAX))
 ```
 
 周末、入住率、进度、提前天数、竞品因子表，以及当日时间衰减和客流密度附加项，均定义在 `hotel rms.py`。本文中的「基准」一律指随附的 `BASELINE_ADR` 配置。
+
+有三处细节和因子表同样决定最终价：
+
+- **入住率只有一个定义。** `Current_Occupancy` 是引擎里唯一的入住率，`Effective_Occupancy` 现在按定义与它相同。分母已扣除维修封房；当天（day 0）取实时看板的数字，因为今晚已售出的房间是「已在店」而不是「在库预订」。不会再出现「显示 80% 却按 0% 定价」。
+- **预订进度必须有分母。** `Pace_Basis` 说明这个比值是否真的算得出来。若去年同日完全没有预订，则标记 `no_history`、进度因子取中性的 `1.00`——引擎不会再凭空造一个分母 1，把「无从判断」说成「落后进度 10%」。
+- **客流密度是当日信号。** 每间在店房客数描述的是今晚楼里住着谁，因此附加项只作用于 `Days_to_Checkin = 0` 的当日到店，绝不会给下个月的房价加价。
+
+报价以整货币单位发布，并且始终落在自己的护栏区间内：引擎先四舍五入（half up），再夹到 `[ceil(MIN_ADR), floor(MAX_ADR)]`，因此 `MIN_ADR = 94.5` 再也不会被发布成 `94`。
 
 ```text
 MIN_ADR = Base_Room_ADR x 0.70
@@ -183,7 +206,7 @@ MAX_ADR = Base_Room_ADR x min(max(2.00, Event_Factor x 1.60), 4.00)
 
 最外层的 `4.00` 是绝对上限。事件余量在 `Event_Factor` 不超过 `2.50` 时完全生效；超过后上限不再增长，因此误填 `15.00` 不会再让 `135` 的基准价变成 `2924` 的夜间报价。绝对上限生效时，运行会输出 `[WARN]`，点出入住日期、因子以及原本会放开的余量。
 
-发布之前 `price_guard.find_violations()` 会复核定价结果：七列价格（`MIN_ADR`、`MAX_ADR`、`Recommended_ADR`、`Model_ADR_Before_Adjustments`、`Post_Model_Adjustment_Factor`、`Final_ADR`、`Expected_RevPAR`）均为有限值、`Final_ADR` 落在 `MIN_ADR`/`MAX_ADR` 之内（为最终取整留半个货币单位的容差）、`MAX_ADR` 大于 `MIN_ADR`、`MIN_ADR` 为正、且同一入住日期与房型不重复。任一项不通过即以退出码 `3` 中止，并向日志写入 `[ERROR]`，不发布与自身护栏矛盾的价格。
+发布之前 `price_guard.find_violations()` 会复核定价结果：七列价格（`MIN_ADR`、`MAX_ADR`、`Recommended_ADR`、`Model_ADR_Before_Adjustments`、`Post_Model_Adjustment_Factor`、`Final_ADR`、`Expected_RevPAR`）均为有限值、`Final_ADR` **严格**落在 `MIN_ADR`/`MAX_ADR` 之内（不再有半个货币单位的取整容差，上面的整单位夹取已保证这一点）、`MAX_ADR` 大于 `MIN_ADR`、`MIN_ADR` 为正、且同一入住日期与房型不重复。任一项不通过即以退出码 `3` 中止，并向日志写入 `[ERROR]`，不发布与自身护栏矛盾的价格。
 
 ## 可复现性
 
@@ -208,6 +231,24 @@ python "hotel rms.py"
 PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：`export RMS_AS_OF_DATETIME="2026-09-01 22:30:00"`（值含空格，需加引号）。
 
 日常运行两个变量都不设。`DEMO` 模式下合成预订数据锚定运行日，不同日期运行会得到不同的 OTB 与进度值；`RMS_AS_OF_DATE` 可消除这一差异。若要可复现的运营数据，还需接入真实 PMS，演示包不含该集成。
+
+## 验证
+
+系统承诺的每一项行为都有一份契约覆盖，放在 `tests/`。它们不是 pytest，而是普通脚本：各自把项目复制到临时沙箱、运行真实入口再断言结果，因此运行它们不会影响 `output/`：
+
+```bat
+py tests/run_all.py                 :: 九份全部，约 80 秒
+py tests/run_all.py --only step7    :: 只跑一份
+```
+
+涉及价格的改动另由冻结基线把关：
+
+```bat
+py golden/diff_reports.py --baseline golden/v7/reports --candidate output --strict
+```
+
+任何价格列变动时 `--strict` 返回退出码 1。不该影响价格的改动必须报 0 差异；应该影响价格的改动必须能证明价差集合是封闭的。`tests/README.txt` 说明每份契约防的是什么，`HANDOVER.md` 记录当前状态。
+
 
 ## 数据来源
 
@@ -264,7 +305,7 @@ PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：
 
 | 报告 | 视图 | 需要了解的列 |
 | --- | --- | --- |
-| `hotel_name_Live_Dashboard_YYYY-MM-DD.csv` | 技术视图，34 列 | 逐日因子、护栏标记、`Recommended_ADR`、`Data_Mode`、`Data_Sources`、`Run_Timestamp` |
+| `hotel_name_Live_Dashboard_YYYY-MM-DD.csv` | 技术视图，36 列 | 逐日因子、`Pace_Basis`、护栏标记、`Recommended_ADR`、`Data_Mode`、`Data_Sources`、`Run_Timestamp` |
 | `hotel_name_RMS_Manager_View_YYYY-MM-DD.csv` | 管理视图，12 列 | `Stay_Date`、`Room_Type`、`Final_ADR`、`ADR_Change_vs_Base`、`Demand_Status`、`Action`、`Reason`、`Confidence_Score`、`Data_Mode`、`Data_Sources`、`Run_Timestamp` |
 
 `ADR_Change_vs_Base` 的显示值与 `Action` 的判定使用同一个已舍入的百分比。
@@ -274,7 +315,16 @@ PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：
 `Recommended_ADR` 是护栏处理前的值，可由 `Base_Room_ADR` 连乘
 `Weekend_Factor`、`Event_Factor`、`Occupancy_Factor`、`Lead_Time_Factor`、
 `Booking_Pace_Factor`、`Competitor_Factor` 与 `Post_Model_Adjustment_Factor`
-复算；`Model_ADR_Before_Adjustments` 是同日调整前的该乘积。12 个因子列让每一步都可核对。
+复算；`Model_ADR_Before_Adjustments` 是同日调整前的该乘积。14 个因子列让每一步都可核对。
+
+`Pace_Basis` 说明进度比值有多少证据支撑：
+
+| 取值 | 含义 | 进度因子 |
+| --- | --- | --- |
+| `measured` | 去年同日有预订，`Hist_OTB_At_Same_LeadTime` 是同一提前天数时已入账的房间数 | `Pace_Ratio = Current_OTB_Rooms / Hist_OTB_At_Same_LeadTime` |
+| `no_history` | `Hist_Pool_Nights` 为 0，没有可作分母的同日数据 | 中性 `1.00` |
+
+`Hist_Pool_Nights` 是去年同日的原始间夜数，用来区分「没有数据」与「有数据但没有预订」。
 
 `Data_Sources` 记录实际使用的输入：`baseline=constant_synthetic`、
 `competitor=synthetic_hash`，`dashboard=` / `reservations=` 取
@@ -298,8 +348,9 @@ PowerShell：`$env:RMS_AS_OF_DATETIME = "2026-09-01 22:30:00"`；bash / macOS：
 
 | 现象 | 处理 |
 | --- | --- |
-| 找不到 `python` | 安装 Python 3.9+ 并加入 `PATH`，或改用 `.bat`（会回退到 `py`） |
-| `ModuleNotFoundError` | `pip install pandas numpy requests schedule`；使用命名时区时在 Windows 另装 `tzdata` |
+| 找不到 `python` | 安装 Python 3.9+ 并加入 `PATH`。`.bat` 会依次尝试 `py -3`、`py`、`python`、`python3` |
+| `[ERROR] No Python interpreter with the required packages` | 启动器没找到可用解释器。消息里列出了每个尝试过的解释器和各自失败原因；按提示执行引号内的 `pip install pandas numpy requests`，或从 python.org 安装并勾选「Add python.exe to PATH」 |
+| 直接跑 `python "hotel rms.py"` 时报 `ModuleNotFoundError` | 那个 `python` 不是装了依赖的那个。用 `Run_Pricing_Now.bat --check` 看哪个可用，或直接用 `.bat`。使用命名时区时 Windows 还需另装 `tzdata` |
 | `[ERROR] Event calendar not found` | 确认 `Public holidays.csv` 在脚本目录；缺失时从版本控制恢复，或按「列」一节重建表头。引擎不会基于不完整日历出价 |
 | 报错带日历行号 | 修正该行后重跑；裸 `MM-DD`、非数值、非有限（`NaN` / `inf`）及 ≤ 0 的因子都会被拒绝 |
 | 报告不在预期位置 | 报告写入 `output/`；看日志里的 `[OK] ... written: <路径>` 行确认具体位置 |

@@ -198,6 +198,7 @@ def load_latest_results():
                 "Data_Mode": tech.get("Data_Mode") or row.get("Data_Mode", ""),
                 "Days_to_Checkin": days_ahead,
                 "Pace_Ratio": pace,
+                "Pace_Basis": tech.get("Pace_Basis", ""),
                 "Competitor_ADR": tech.get("Competitor_ADR", ""),
                 "RevPAR": tech.get("Expected_RevPAR", ""),
             }
@@ -1002,17 +1003,22 @@ class RMSApp:
 
         occ, pace = r["Occ"], r["Pace_Ratio"]
         supply = "Current occupancy {}".format(occ)
-        if pace is not None:
-            if pace > 1.2:
-                supply += "\nBooking pace {:.0f}% faster than history -> hot, raise rate".format(
-                    (pace - 1) * 100
-                )
-            elif pace < 0.8:
-                supply += "\nBooking pace {:.0f}% slower than history -> quiet, consider discount".format(
-                    (1 - pace) * 100
-                )
-            else:
-                supply += "\nBooking pace in line with history -> hold rate"
+        if r.get("Pace_Basis") == "no_history" or pace is None:
+            # Never claim a pace comparison that was not measured. A neutral
+            # factor driven by missing history used to read as "in line with
+            # history", which invited staff to trust a number nobody computed.
+            supply += ("\nNo booking history for this date"
+                       "\nPace not measurable -> neutral (1.00x)")
+        elif pace > 1.2:
+            supply += "\nBooking pace {:.0f}% faster than history -> hot, raise rate".format(
+                (pace - 1) * 100
+            )
+        elif pace < 0.8:
+            supply += "\nBooking pace {:.0f}% slower than history -> quiet, consider discount".format(
+                (1 - pace) * 100
+            )
+        else:
+            supply += "\nBooking pace in line with history -> hold rate"
         self.set_factor(1, supply)
 
         ahead = r["Days_to_Checkin"]
